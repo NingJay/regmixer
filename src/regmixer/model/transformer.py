@@ -188,7 +188,7 @@ class TransformerConfigBuilder:
     def get_tokenizer_config(self, tokenizer) -> TokenizerConfig:
         try:
             return SupportedTokenizers[tokenizer].value
-        except ValueError as e:
+        except KeyError as e:
             logger.info(f"Invalid tokenizer identifier: {tokenizer}")
             raise e
 
@@ -293,6 +293,9 @@ class TransformerConfigBuilder:
             seed=self.seed,
             processes=min(os.cpu_count() or 1, 16),
             dtype=self.dataset_dtype,
+            tokenizer=(
+                str(self.tokenizer.identifier) if self.tokenizer.identifier is not None else "dolma2"
+            ),
         ).build()
 
         dataset_config = NumpyDatasetConfig(

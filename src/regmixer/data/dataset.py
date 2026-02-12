@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from glob import glob
 from pathlib import Path
 from typing import Any, List
 from urllib.parse import urlparse
@@ -12,6 +13,7 @@ from olmo_core.data.types import NumpyDatasetDType
 from olmo_core.io import is_url
 
 from regmixer.aliases import PathType, SourceInstance
+from regmixer.data.parquet_utils import materialize_parquet_paths
 
 
 @dataclass
@@ -21,6 +23,7 @@ class MixtureBuilder:
     sequence_length: int
     seed: int
     dtype: NumpyDatasetDType
+    tokenizer: str
     processes: int = 1
     fs: s3fs.S3FileSystem = field(default_factory=lambda: s3fs.S3FileSystem())
 
@@ -42,7 +45,10 @@ class MixtureBuilder:
                         f"Glob expansion is not currently supported for '{parsed.scheme}' files"
                     )
             else:
-                raise NotImplementedError("Glob expansion is only supported for URLs")
+                matches = sorted(glob(path, recursive=True))
+                if not matches:
+                    raise FileNotFoundError(path)
+                results.extend([str(Path(match).resolve()) for match in matches])
 
         return results
 
@@ -51,10 +57,16 @@ class MixtureBuilder:
         for source in self.sources:
             globs = [path for path in source.paths if "*" in path]
             paths = [path for path in source.paths if path not in globs]
+            resolved_paths = paths + self.expand_globs(globs)
+            resolved_paths = materialize_parquet_paths(
+                resolved_paths,
+                dtype=self.dtype,
+                tokenizer=self.tokenizer,
+            )
             source_configs.append(
                 SourceMixtureConfig(
                     source_name=source.name,
-                    paths=paths + self.expand_globs(globs),
+                    paths=resolved_paths,
                     target_ratio=source.ratio,
                     max_repetition_ratio=source.repetition_factor,
                 )

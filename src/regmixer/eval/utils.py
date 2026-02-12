@@ -33,8 +33,16 @@ from matplotlib.cm import ScalarMappable
 import subprocess
 from io import StringIO
 
-from cookbook.aliases import SwarmConfig as CookbookExperimentConfig
-from cookbook.utils.data import get_token_counts_and_ratios
+try:
+    from cookbook.aliases import SwarmConfig as CookbookExperimentConfig
+    from cookbook.utils.data import get_token_counts_and_ratios
+except ModuleNotFoundError:  # optional dependency for constrained objective paths
+    CookbookExperimentConfig = Any
+
+    def get_token_counts_and_ratios(*args, **kwargs):
+        raise ModuleNotFoundError(
+            "cookbook package is required for constrained-objective evaluation paths"
+        )
 
 from regmixer.synthesize_mixture import calculate_priors
 from regmixer.eval.constants import WandbMetrics, GroupedWandbMetrics
@@ -851,8 +859,7 @@ def mk_run_history(run: Run, samples: int, eval_metric_group: GroupedWandbMetric
         except KeyError:
             print(run.id)
             print(run.summary.keys())
-
-            breakpoint()
+            raise
         return mk_run_instance(run, summary, samples)
     else:
         return mk_run_instance(run, run.scan_history(keys=eval_metric_group.value), samples)

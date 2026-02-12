@@ -288,7 +288,6 @@ def mk_mixes(
     config = ExperimentConfig(**data)
     mixes = mk_mixtures(config, group_uuid, use_cache=use_cache)
     mix_string = prettify_mixes(mixes)
-    breakpoint()
 
     if not output:
         output = Path(f"/tmp/regmixer/{config.name}_{group_uuid}.json")

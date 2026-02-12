@@ -112,3 +112,10 @@ class SupportedModels(Enum):
 class SupportedTokenizers(Enum):
     dolma2 = TokenizerConfig.dolma2()
     gpt_neox = TokenizerConfig.gpt_neox_olmo_dolma_v1_5()
+    # OpenSeek parquet shards carry pre-tokenized IDs in [0, 151850] with EOS=151850.
+    openseek = TokenizerConfig(
+        vocab_size=151851,
+        eos_token_id=151850,
+        pad_token_id=151850,
+        bos_token_id=151849,
+    )

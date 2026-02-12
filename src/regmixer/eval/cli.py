@@ -535,7 +535,13 @@ def fit(
 
     output_dir = save_eval_config(eval_config, output_dir, custom_name)
 
-    api = wandb.Api()
+    api = None
+
+    def get_api():
+        nonlocal api
+        if api is None:
+            api = wandb.Api()
+        return api
 
     eval_metric_group = GroupedWandbMetrics.all_metrics
     eval_metric_group_name = eval_metric_group.name
@@ -557,7 +563,13 @@ def fit(
     if no_cache:
         logger.info(f"Cache disabled, will not use cache for run samples...")
         run_instances = get_runs_from_api(
-            api, workspace, full_group_names, cache_path, no_cache, num_samples, eval_metric_group
+            get_api(),
+            workspace,
+            full_group_names,
+            cache_path,
+            no_cache,
+            num_samples,
+            eval_metric_group,
         )
     else:
         try:
@@ -570,7 +582,13 @@ def fit(
         except FileNotFoundError:
             logger.warning(f"Failed to load cache from {cache_path}, fetching runs from API...")
             run_instances = get_runs_from_api(
-                api, workspace, full_group_names, cache_path, no_cache, num_samples, eval_metric_group
+                get_api(),
+                workspace,
+                full_group_names,
+                cache_path,
+                no_cache,
+                num_samples,
+                eval_metric_group,
             )
 
     # Filter out failed runs or runs without evals
@@ -704,7 +722,6 @@ def fit(
         metrics[numerical_cols] = metrics[numerical_cols].apply(pd.to_numeric, errors='coerce')
         ratios = ratios[ratios['run'].isin(metrics.run)]
 
-        breakpoint()
         if len(support_domains) == 0 and len(train_split) == 1:
             assert np.isclose(ratios[ratios.columns[3:]].sum(axis=1).sum(), len(ratios)), "Ratios do not add up to 1!"
         if fixed_weight is not None:
@@ -786,7 +803,6 @@ def fit(
 
     if not bad_rows.empty:
         logger.warning(f"Found NaNs in the following rows, dropping them! {bad_rows.index.tolist()}")
-        breakpoint()
         metrics = metrics.drop(index=bad_rows.index)
         ratios = ratios.drop(index=bad_rows.index)
 
@@ -936,7 +952,13 @@ def fit(
 
         else:
             reference_model_run_instance = get_runs_from_api(
-                api, workspace, [dro_reference_model_id], cache_path, True, num_samples, eval_metric_group
+                get_api(),
+                workspace,
+                [dro_reference_model_id],
+                cache_path,
+                True,
+                num_samples,
+                eval_metric_group,
             )[0]
 
             if use_reference_model_predicted_scores:
@@ -1132,5 +1154,5 @@ def fit(
     logger.info(f"Results saved to {output_dir}")
 
 
-if __name__ == "main":
+if __name__ == "__main__":
     cli(obj={})

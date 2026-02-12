@@ -1,0 +1,19 @@
+[OK] mix=0000 gpu=0 rc=0 log=outputs/dryfit_fit/logs/parquet-e2e-fit-train-0000.log
+[OK] mix=0002 gpu=2 rc=0 log=outputs/dryfit_fit/logs/parquet-e2e-fit-train-0002.log
+[OK] mix=0006 gpu=6 rc=0 log=outputs/dryfit_fit/logs/parquet-e2e-fit-train-0006.log
+[OK] mix=0003 gpu=3 rc=0 log=outputs/dryfit_fit/logs/parquet-e2e-fit-train-0003.log
+[OK] mix=0007 gpu=7 rc=0 log=outputs/dryfit_fit/logs/parquet-e2e-fit-train-0007.log
+[OK] mix=0005 gpu=5 rc=0 log=outputs/dryfit_fit/logs/parquet-e2e-fit-train-0005.log
+[OK] mix=0004 gpu=4 rc=0 log=outputs/dryfit_fit/logs/parquet-e2e-fit-train-0004.log
+[OK] mix=0001 gpu=1 rc=0 log=outputs/dryfit_fit/logs/parquet-e2e-fit-train-0001.log
+[OK] mix=0010 gpu=6 rc=0 log=outputs/dryfit_fit/logs/parquet-e2e-fit-train-0010.log
+[OK] mix=0011 gpu=3 rc=0 log=outputs/dryfit_fit/logs/parquet-e2e-fit-train-0011.log
+[OK] mix=0008 gpu=0 rc=0 log=outputs/dryfit_fit/logs/parquet-e2e-fit-train-0008.log
+[OK] mix=0009 gpu=2 rc=0 log=outputs/dryfit_fit/logs/parquet-e2e-fit-train-0009.log
+{
+  "total": 12,
+  "succeeded": 12,
+  "failed": 0,
+  "failed_mix_indices": [],
+  "failures": []
+}

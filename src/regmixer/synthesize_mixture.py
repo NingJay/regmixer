@@ -31,6 +31,7 @@ import hashlib
 import json
 
 from regmixer.aliases import ExperimentConfig, SourceConfig
+from regmixer.data.parquet_utils import materialize_parquet_paths
 
 
 class ConfigDefaults:
@@ -461,7 +462,10 @@ def mk_mixtures(
     num_samples = config.variants
     sources = config.sources
     leaf_dist, available_tokens, leaf_tokens = calculate_priors(
-        sources, config.dtype, use_cache=use_cache
+        sources,
+        config.dtype,
+        use_cache=use_cache,
+        tokenizer=config.tokenizer,
     )
     logger.info(f"Total tokens for config: {available_tokens:,}")
     logger.info(f"Using seed: {config.seed}")
@@ -619,7 +623,10 @@ def get_leaf_configs(source_config):
 
 
 def calculate_priors(
-    source_configs: list[SourceConfig], dtype: NumpyDatasetDType, use_cache: bool
+    source_configs: list[SourceConfig],
+    dtype: NumpyDatasetDType,
+    use_cache: bool,
+    tokenizer: Optional[str] = None,
 ) -> Tuple[dict[str, float], int, dict[str, int]]:
     config_hash = hashlib.md5(
         json.dumps(
@@ -679,7 +686,12 @@ def calculate_priors(
 
             globs = [path for path in source.paths if "*" in path]
             paths = [path for path in source.paths if path not in globs]
-            source.paths = paths + expand_globs(fs, globs) if globs else paths
+            expanded_paths = paths + expand_globs(fs, globs) if globs else paths
+            source.paths = materialize_parquet_paths(
+                expanded_paths,
+                dtype=dtype,
+                tokenizer=tokenizer,
+            )
 
         
         futures = {

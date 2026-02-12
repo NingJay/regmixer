@@ -21,7 +21,8 @@ dependencies = [
     "yaspin",
     "gcsfs",
     "pyarrow<21",
-    "datasets>=3,<4"
+    "datasets>=3,<4",
+    "tokenizers>=0.22,<1"
 ]
 [project.optional-dependencies]
 dev = [

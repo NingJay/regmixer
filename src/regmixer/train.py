@@ -16,6 +16,33 @@ from regmixer.model.transformer import TransformerConfigBuilder
 logger = logging.getLogger(__name__)
 
 
+def maybe_enable_swanlab_sync() -> None:
+    """
+    Mirror wandb logs to SwanLab and disable wandb network upload.
+    This is a no-op if swanlab is unavailable or explicitly disabled.
+    """
+    if os.environ.get("REGMIXER_DISABLE_SWANLAB_SYNC", "0") == "1":
+        logger.info("SwanLab sync disabled by REGMIXER_DISABLE_SWANLAB_SYNC=1")
+        return
+
+    try:
+        import swanlab
+    except ModuleNotFoundError:
+        logger.warning("swanlab is not installed; falling back to direct wandb logging")
+        return
+    except Exception as e:
+        logger.warning(f"Failed to import swanlab, falling back to wandb: {e}")
+        return
+
+    try:
+        # Per SwanLab docs: call before wandb.init(). We disable wandb upload
+        # because this environment cannot reach wandb.
+        swanlab.sync_wandb(wandb_run=False)
+        logger.info("Enabled SwanLab sync_wandb(wandb_run=False)")
+    except Exception as e:
+        logger.warning(f"Failed to enable swanlab sync_wandb, falling back to wandb: {e}")
+
+
 class PythonLiteralOption(click.Option):
     """
     Custom click option to parse python literals.
@@ -160,6 +187,7 @@ def train(
     """
     Launch a training run with the given parameters.
     """
+    maybe_enable_swanlab_sync()
 
     # Rebuild the source instances from the parsed tuples
     sources: List[SourceInstance] = []

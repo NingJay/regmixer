@@ -1,0 +1,79 @@
+name: "nemo-cc-round1-parquet-e2e-smoke"
+description: "Round-1 parquet e2e smoke test (propose -> train -> eval)"
+budget: "ai2/oe-data"
+workspace: "ai2/dolma2"
+nodes: 1
+gpus: 1
+variants: 1
+preemptible: true
+max_tokens: 16_384
+allow_repetition: true
+sequence_length: 2048
+seed: 42
+source_mix_temperature: 0.8
+topic_mix_temperature: 0.8
+minimum_source_weight: 0.01
+minimum_topic_weight: 0.05
+min_source_strength: 0.2
+max_source_strength: 2
+min_topic_strength: 0.2
+max_topic_strength: 2
+sample_multiplier: 100
+proxy_model_id: "olmo_30m"
+tokenizer: "openseek"
+weka: false
+dtype: "uint32"
+priority: low
+cluster: local
+device_batch_size: 1
+nonzero_weight:
+  - actual
+  - distill
+  - diverse_qa_pairs
+  - extract_knowledge
+  - knowledge_list
+  - wrap_medium
+
+sources:
+  - name: actual
+    topics:
+      - name: high
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-actual-actual-high_part_142_text_document/train-00000-of-00010.parquet
+      - name: medium_high
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-medium-actual-actual-high_part_92_text_document/train-00000-of-00010.parquet
+      - name: medium
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-actual-actual-mid_part_189_text_document/train-00000-of-00007.parquet
+      - name: medium_low
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-medium-actual-actual-low_part_113_text_document/train-00000-of-00006.parquet
+      - name: low
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-actual-actual-low_part_62_text_document/train-00000-of-00004.parquet
+
+  - name: distill
+    paths:
+      - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-synthetic-distill-high_part_76_text_document/train-00000-of-00004.parquet
+
+  - name: diverse_qa_pairs
+    paths:
+      - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-synthetic-diverse_qa_pairs-high_part_244_text_document/train-00000-of-00005.parquet
+
+  - name: extract_knowledge
+    paths:
+      - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-synthetic-extract_knowledge-high_part_498_text_document/train-00000-of-00005.parquet
+
+  - name: knowledge_list
+    paths:
+      - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-synthetic-knowledge_list-high_part_86_text_document/train-00000-of-00004.parquet
+
+  - name: wrap_medium
+    topics:
+      - name: high
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-synthetic-wrap_medium-high_part_47_text_document/train-00000-of-00007.parquet
+      - name: low
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-low-synthetic-wrap_medium-low_part_10_text_document/train-00000-of-00004.parquet
