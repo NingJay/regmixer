@@ -3,12 +3,21 @@ from os import PathLike
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from beaker import Priority
 from olmo_core.data.types import NumpyDatasetDType
-from olmo_core.launch.beaker import BeakerLaunchConfig
 from pydantic import BaseModel
 import pydantic
 from typing import List, Optional, Union
+
+try:
+    from beaker import Priority
+except ModuleNotFoundError:
+    # Local-only flows (e.g. generate-mixes / run_local_variant) do not need beaker.
+    Priority = str  # type: ignore[assignment]
+
+try:
+    from olmo_core.launch.beaker import BeakerLaunchConfig
+except ModuleNotFoundError:
+    BeakerLaunchConfig = Any  # type: ignore[assignment]
 
 PathType = Union[Path, PathLike[Any], str]
 

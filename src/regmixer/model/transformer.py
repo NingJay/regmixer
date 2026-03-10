@@ -140,6 +140,7 @@ class TransformerConfigBuilder:
         s3: bool = True,
         profile: bool = False,
         global_batch_size: Optional[int] = None,
+        root_dir: Optional[str] = None,
     ):
         self.run_name = run_name
         self.sources = sources
@@ -158,7 +159,9 @@ class TransformerConfigBuilder:
         self.tokenizer = self.get_tokenizer_config(tokenizer=tokenizer)
         self.data_dir: str = "s3://ai2-llm"
         self.dataset_dtype = NumpyDatasetDType[dtype]
-        self.root_dir = f"/tmp/{self.run_name}"
+        env_root_dir = os.environ.get("REGMIXER_OUTPUT_ROOT")
+        self.root_dir = root_dir or env_root_dir or f"/tmp/{self.run_name}"
+        self._root_dir_overridden = bool(root_dir or env_root_dir)
         self.cluster = cluster
         self.weka = weka
 
@@ -175,11 +178,12 @@ class TransformerConfigBuilder:
 
     def _setup_dirs(self) -> None:
         """Setup checkpoint directory based on cluster configuration."""
-        if any(substring in self.cluster for substring in ["augusta"]):
-            self.root_dir = "gs://ai2-llm"
-        elif any(substring in self.cluster for substring in ["jupiter", "saturn"]) and self.weka:
-            logger.info("Using Weka bucket as root dir")
-            self.root_dir = "/weka/oe-training-default/ai2-llm"
+        if not self._root_dir_overridden:
+            if any(substring in self.cluster for substring in ["augusta"]):
+                self.root_dir = "gs://ai2-llm"
+            elif any(substring in self.cluster for substring in ["jupiter", "saturn"]) and self.weka:
+                logger.info("Using Weka bucket as root dir")
+                self.root_dir = "/weka/oe-training-default/ai2-llm"
 
         self.checkpoint_dir = (
             f"{self.root_dir}/checkpoints/{self.beaker_user.lower()}/{self.run_name}"

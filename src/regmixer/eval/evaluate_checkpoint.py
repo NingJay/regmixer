@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import shutil
 from typing import Optional
 import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
@@ -86,7 +87,7 @@ def main(
     budget: str,
     workspace: str,
     priority: str,
-    formats: Optional[str],
+    format: Optional[str],
     eval_groups: Optional[str],
     eval_tasks: Optional[str],
     partition_size: Optional[int],
@@ -128,7 +129,7 @@ def main(
         else:
             clusters = cluster
 
-    format_array = formats.split(",") if formats else ["rc"]
+    format_array = format.split(",") if format else ["rc"]
     for fmt in format_array:
         if fmt not in ALL_FORMAT_OPTIONS:
             print(f"Error: Invalid format '{fmt}'. Valid options are: {ALL_FORMAT_OPTIONS}")
@@ -163,15 +164,18 @@ def main(
     checkpoint_name = get_checkpoint_name(checkpoint)
     output_prefix = f"s3://ai2-llm/evaluation/{dashboard}/{checkpoint_name}"
 
-    if (
-        subprocess.run(
-            ["command", "-v", "oe-eval"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        ).returncode
-        != 0
-    ):
-        print(
-            "Error: `oe-eval` is not installed; run `pip install git+https://github.com/allenai/oe-eval-internal.git`"
-        )
+    eval_binary = shutil.which("oe-eval")
+    if eval_binary is None:
+        if shutil.which("olmes") is not None:
+            print(
+                "Error: this launcher expects 'oe-eval' binary semantics. "
+                "For local checkpoint evaluation use: `python -m regmixer.cli eval ...`"
+            )
+        else:
+            print(
+                "Error: `oe-eval` is not installed; run "
+                "`pip install git+https://github.com/allenai/oe-eval-internal.git`"
+            )
         sys.exit(1)
 
     num_tasks = len(task_list)
@@ -221,7 +225,7 @@ def main(
                 continue
 
         command = [
-            "oe-eval",
+            eval_binary,
             "--model",
             f"{checkpoint_name}{suffix}",
             "--model-args",

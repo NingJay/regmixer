@@ -55,5 +55,6 @@ site/
 # Outputs
 
 output/
+outputs/
 cache/
 *.ipynb

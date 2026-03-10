@@ -6,8 +6,6 @@ from typing import Optional
 
 import click
 import yaml
-from beaker import Beaker
-from beaker.services.job import JobClient
 from olmo_core.utils import generate_uuid, prepare_cli_environment
 from tqdm import tqdm
 from yaspin import yaspin
@@ -23,6 +21,18 @@ from regmixer.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _require_beaker_client():
+    try:
+        from beaker import Beaker
+        from beaker.services.job import JobClient
+    except ModuleNotFoundError as exc:
+        raise click.ClickException(
+            "This command requires the 'beaker' package. "
+            "Install beaker first, or use local-only commands such as generate-mixes."
+        ) from exc
+    return Beaker, JobClient
 
 
 @click.group()
@@ -60,6 +70,7 @@ def cli():
 )
 def launch(config: Path, mixture_file: Optional[Path], dry_run: bool, no_cache: bool):
     """Launch an experiment."""
+    Beaker, _ = _require_beaker_client()
 
     with open(config, "r") as f:
         data = yaml.safe_load(f)
@@ -150,6 +161,7 @@ def launch(config: Path, mixture_file: Optional[Path], dry_run: bool, no_cache: 
 
 
 def status_for_group(path: Path, group_id: str):
+    Beaker, JobClient = _require_beaker_client()
     beaker = Beaker.from_env()
     client = JobClient(beaker=beaker)
     config = config_from_path(path)
@@ -166,6 +178,7 @@ def status_for_group(path: Path, group_id: str):
 
 
 def stop_for_group(path: Path, group_id: str):
+    Beaker, JobClient = _require_beaker_client()
     beaker = Beaker.from_env()
     client = JobClient(beaker=beaker)
     config = config_from_path(path)
@@ -205,7 +218,334 @@ def stop_for_group(path: Path, group_id: str):
 )
 def generate_mixes(config: Path, output: Optional[Path] = None):
     """Generate a set of mixtures based on a provided config"""
-    mk_mixes(config, output)
+    # mk_mixes signature is (config_file, group_uuid, output, use_cache).
+    # Use keyword arguments to avoid accidental positional mismatch.
+    mk_mixes(
+        config_file=config,
+        group_uuid=generate_uuid()[:8],
+        output=output,
+    )
+
+
+@cli.command(name="convert-hf")
+@click.option(
+    "-c",
+    "--config",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to the experiment configuration file.",
+)
+@click.option(
+    "--log-dir",
+    type=click.Path(exists=True),
+    required=True,
+    help="Log directory for the training run group (used to infer summaries/output roots).",
+)
+@click.option(
+    "--summary-dir",
+    type=click.Path(exists=True),
+    required=False,
+    default=None,
+    help="Optional override for summary directory.",
+)
+@click.option(
+    "--tokenizer-dir",
+    type=click.Path(exists=True),
+    required=False,
+    default=None,
+    help="Optional tokenizer directory copied into converted HF checkpoints.",
+)
+@click.option(
+    "--hf-cache-dir",
+    type=click.Path(),
+    required=False,
+    default=None,
+    help="Optional directory for converted HF checkpoints.",
+)
+@click.option(
+    "--output-manifest",
+    type=click.Path(),
+    required=False,
+    default=None,
+    help="Optional manifest CSV path listing converted runs and HF directories.",
+)
+@click.option(
+    "--mix-start",
+    type=int,
+    default=None,
+    required=False,
+    help="Optional first mix index (inclusive) to convert.",
+)
+@click.option(
+    "--mix-end",
+    type=int,
+    default=None,
+    required=False,
+    help="Optional last mix index (inclusive) to convert.",
+)
+@click.option(
+    "--force-convert",
+    is_flag=True,
+    default=False,
+    help="Re-convert checkpoints even if HF export already exists.",
+)
+def convert_hf_command(
+    config: Path,
+    log_dir: Path,
+    summary_dir: Optional[Path],
+    tokenizer_dir: Optional[Path],
+    hf_cache_dir: Optional[Path],
+    output_manifest: Optional[Path],
+    mix_start: Optional[int],
+    mix_end: Optional[int],
+    force_convert: bool,
+):
+    """Convert local checkpoints to HF model directories and write a manifest."""
+    from regmixer.local_eval import run_local_hf_conversion
+
+    run_local_hf_conversion(
+        config_path=config,
+        log_dir=log_dir,
+        summary_dir=summary_dir,
+        tokenizer_dir=tokenizer_dir,
+        hf_cache_dir=hf_cache_dir,
+        mix_start=mix_start,
+        mix_end=mix_end,
+        force_convert=force_convert,
+        output_manifest=output_manifest,
+    )
+
+
+@cli.command(name="eval")
+@click.option(
+    "-c",
+    "--config",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to the experiment configuration file.",
+)
+@click.option(
+    "--log-dir",
+    type=click.Path(exists=True),
+    required=True,
+    help="Log directory for the training run group (used to infer summaries/output roots).",
+)
+@click.option(
+    "--output-csv",
+    type=click.Path(),
+    required=True,
+    help="Path to write aggregated local eval metrics CSV.",
+)
+@click.option(
+    "--summary-dir",
+    type=click.Path(exists=True),
+    required=False,
+    default=None,
+    help="Optional override for summary directory.",
+)
+@click.option(
+    "--mix-file",
+    type=click.Path(exists=True),
+    required=False,
+    default=None,
+    help="Optional override for mix JSON file.",
+)
+@click.option(
+    "--tokenizer-dir",
+    type=click.Path(exists=True),
+    required=False,
+    default=None,
+    help="Optional tokenizer directory copied into converted HF checkpoints.",
+)
+@click.option(
+    "--hf-cache-dir",
+    type=click.Path(),
+    required=False,
+    default=None,
+    help="Optional directory for converted HF checkpoints.",
+)
+@click.option(
+    "--results-dir",
+    type=click.Path(),
+    required=False,
+    default=None,
+    help="Optional directory for raw lm_eval outputs.",
+)
+@click.option(
+    "--task-groups",
+    type=str,
+    default="core,mmlu",
+    show_default=True,
+    help="Comma-separated task groups to evaluate locally. Supported: core,mmlu.",
+)
+@click.option(
+    "--tasks",
+    type=str,
+    default=None,
+    help="Optional explicit comma-separated lm_eval task list; overrides --task-groups.",
+)
+@click.option(
+    "--num-fewshot",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Few-shot count passed to lm_eval.",
+)
+@click.option(
+    "--batch-size",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Batch size passed to lm_eval.",
+)
+@click.option(
+    "--limit",
+    type=float,
+    default=None,
+    required=False,
+    help="Optional lm_eval limit for partial runs (testing only).",
+)
+@click.option(
+    "--mix-start",
+    type=int,
+    default=None,
+    required=False,
+    help="Optional first mix index (inclusive) to evaluate.",
+)
+@click.option(
+    "--mix-end",
+    type=int,
+    default=None,
+    required=False,
+    help="Optional last mix index (inclusive) to evaluate.",
+)
+@click.option(
+    "--force-convert",
+    is_flag=True,
+    default=False,
+    help="Re-convert checkpoints even if HF export already exists.",
+)
+@click.option(
+    "--force-eval",
+    is_flag=True,
+    default=False,
+    help="Re-run lm_eval even if cached raw results exist.",
+)
+def eval_command(
+    config: Path,
+    log_dir: Path,
+    output_csv: Path,
+    summary_dir: Optional[Path],
+    mix_file: Optional[Path],
+    tokenizer_dir: Optional[Path],
+    hf_cache_dir: Optional[Path],
+    results_dir: Optional[Path],
+    task_groups: str,
+    tasks: Optional[str],
+    num_fewshot: int,
+    batch_size: int,
+    limit: Optional[float],
+    mix_start: Optional[int],
+    mix_end: Optional[int],
+    force_convert: bool,
+    force_eval: bool,
+):
+    """Run local full eval from local checkpoints and write eval metrics CSV."""
+    from regmixer.local_eval import run_local_eval
+
+    run_local_eval(
+        config_path=config,
+        log_dir=log_dir,
+        output_csv=output_csv,
+        summary_dir=summary_dir,
+        mix_file=mix_file,
+        tokenizer_dir=tokenizer_dir,
+        hf_cache_dir=hf_cache_dir,
+        results_dir=results_dir,
+        task_groups=task_groups,
+        tasks=tasks,
+        num_fewshot=num_fewshot,
+        batch_size=batch_size,
+        limit=limit,
+        mix_start=mix_start,
+        mix_end=mix_end,
+        force_convert=force_convert,
+        force_eval=force_eval,
+    )
+
+
+@cli.command(name="fit-mixture")
+@click.option(
+    "-c",
+    "--config",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to experiment configuration file (kept for script compatibility).",
+)
+@click.option(
+    "--eval-metrics",
+    type=click.Path(exists=True),
+    required=True,
+    help="CSV produced by local eval step.",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    required=True,
+    help="Output JSON path for proposed mixture weights.",
+)
+@click.option(
+    "--mix-file",
+    type=click.Path(exists=True),
+    required=False,
+    default=None,
+    help="Optional mix JSON file override when eval CSV lacks weight columns.",
+)
+@click.option(
+    "--metric-columns",
+    type=str,
+    required=False,
+    default=None,
+    help="Optional comma-separated subset of metric columns from eval CSV.",
+)
+@click.option(
+    "--search-samples",
+    type=int,
+    required=False,
+    default=200000,
+    show_default=True,
+    help="Number of Dirichlet samples for proposed-mixture search.",
+)
+@click.option(
+    "--seed",
+    type=int,
+    required=False,
+    default=42,
+    show_default=True,
+    help="Random seed for search.",
+)
+def fit_mixture_command(
+    config: Path,
+    eval_metrics: Path,
+    output: Path,
+    mix_file: Optional[Path],
+    metric_columns: Optional[str],
+    search_samples: int,
+    seed: int,
+):
+    """Fit a local regression surface and propose p* weights from eval CSV."""
+    from regmixer.local_fit import run_local_fit
+
+    run_local_fit(
+        config_path=config,
+        eval_metrics=eval_metrics,
+        output=output,
+        mix_file=mix_file,
+        metric_columns=metric_columns,
+        search_samples=search_samples,
+        seed=seed,
+    )
 
 
 @cli.command()
@@ -221,7 +561,7 @@ def validate(config: Path):
     with open(config, "r") as f:
         data = yaml.safe_load(f)
 
-    mixes = mk_mixes(config)
+    mixes = mk_mixes(config_file=config, group_uuid=generate_uuid()[:8])
     experiment_group = mk_experiment_group(ExperimentConfig(**data), mixes, generate_uuid()[:8])
     beaker_user = "validate-no-op"
 

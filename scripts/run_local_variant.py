@@ -24,13 +24,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--global-batch-size",
         type=int,
-        default=1,
-        help="Global batch size in sequences (before multiplying sequence length).",
+        default=None,
+        help="Global batch size in sequences. If not set, defaults to max_tokens // sequence_length (capped at 512).",
     )
     parser.add_argument(
         "--summary-out",
         default=None,
         help="Optional path to write a JSON summary for this local run.",
+    )
+    parser.add_argument(
+        "--output-root-dir",
+        default=None,
+        help="Optional root directory for local training artifacts (replaces /tmp defaults).",
     )
     return parser.parse_args()
 
@@ -55,6 +60,8 @@ def ensure_single_process_dist_env() -> None:
 def main() -> None:
     args = parse_args()
     ensure_single_process_dist_env()
+    if args.output_root_dir:
+        Path(args.output_root_dir).mkdir(parents=True, exist_ok=True)
 
     with Path(args.config).open("r") as f:
         config = ExperimentConfig(**yaml.safe_load(f))
@@ -70,6 +77,14 @@ def main() -> None:
     mix_map = {k: (float(v[0]), float(v[1])) for k, v in mix.items()}
     sources = mk_source_instances(config.sources, mix_map)
     max_sequences_per_step = max(1, config.max_tokens // config.sequence_length)
+
+    # 自动计算 global_batch_size（如果未指定）
+    if args.global_batch_size is None:
+        max_global_batch = config.max_tokens // config.sequence_length
+        # 对于大规模训练，cap 在 512 避免梯度累积过多
+        args.global_batch_size = min(max_global_batch, 512)
+        print(f"[auto] global_batch_size={args.global_batch_size} (max={max_global_batch}, capped at 512)")
+
     global_batch_size = max(1, args.global_batch_size)
     if global_batch_size > max_sequences_per_step:
         print(
@@ -96,6 +111,7 @@ def main() -> None:
             weka=config.weka,
             device_batch_size=config.device_batch_size,
             global_batch_size=global_batch_size,
+            root_dir=args.output_root_dir,
         ).build()
         print(f"effective_global_batch_size={global_batch_size}")
         print(

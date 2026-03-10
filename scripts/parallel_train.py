@@ -63,6 +63,7 @@ class WorkerConfig:
     log_dir: str
     summary_dir: str
     pythonpath: str
+    output_root_dir: Optional[str] = None
     beaker_user: Optional[str] = None
     global_batch_size: Optional[int] = None
 
@@ -127,6 +128,11 @@ def parse_args() -> argparse.Namespace:
         help="Directory for per-task summaries.",
     )
     parser.add_argument(
+        "--output-root-dir",
+        default=None,
+        help="Optional root directory for training artifacts (replaces /tmp defaults).",
+    )
+    parser.add_argument(
         "--beaker-user",
         default=None,
         help="Optional pass-through to run_local_variant.py --beaker-user.",
@@ -179,6 +185,8 @@ def build_command(cfg: WorkerConfig, mix_index: int, run_name: str, summary_out:
         "--summary-out",
         summary_out,
     ]
+    if cfg.output_root_dir:
+        cmd.extend(["--output-root-dir", cfg.output_root_dir])
     if cfg.beaker_user:
         cmd.extend(["--beaker-user", cfg.beaker_user])
     if cfg.global_batch_size is not None:
@@ -269,6 +277,7 @@ def main() -> int:
         log_dir=args.log_dir,
         summary_dir=args.summary_dir,
         pythonpath=args.pythonpath,
+        output_root_dir=args.output_root_dir,
         beaker_user=args.beaker_user,
         global_batch_size=args.global_batch_size,
     )

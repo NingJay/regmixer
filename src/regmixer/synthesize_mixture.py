@@ -196,7 +196,8 @@ def generate_weights_dirichlet(
     The list of domains is always sorted to be in alphabetical order (i.e. alphabetical on sources, then on topics).
     """
 
-    token_scale = available_tokens / max_tokens
+    total_available_tokens = int(available_tokens)
+    token_scale = total_available_tokens / max_tokens
     logger.info(f"Source token population is {token_scale:.2f}:1 target population.")
 
     collected_samples: list[Tuple[np.ndarray, np.ndarray]] = []
@@ -400,13 +401,19 @@ def generate_weights_dirichlet(
 
         reject = False
         if allow_repetition:
+            # Use a stable per-domain token budget; do not mutate the total token count
+            # inside the loop. Otherwise repetition factors can be silently miscomputed.
+            per_domain_available_tokens = [
+                int(prior_dist[idx] * total_available_tokens) for idx in range(len(domains))
+            ]
+
             for idx, _ in enumerate(domains):
-                available_tokens = int(prior_dist[idx] * available_tokens)
+                domain_available_tokens = per_domain_available_tokens[idx]
                 required_tokens = int(selected[0][idx] * max_tokens)
 
                 repetition = (
-                    np.ceil(required_tokens / available_tokens * 1000) / 1000
-                    if available_tokens != 0
+                    np.ceil(required_tokens / domain_available_tokens * 1000) / 1000
+                    if domain_available_tokens != 0
                     else 0
                 )
 

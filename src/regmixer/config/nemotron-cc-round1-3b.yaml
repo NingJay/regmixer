@@ -1,0 +1,104 @@
+name: "nemo-cc-round1-3b"
+description: "Round-1: Nemotron-CC 内部比例搜索（128 variants × 3B tokens）"
+budget: "ai2/oe-data"
+workspace: "ai2/dolma2"
+nodes: 1
+gpus: 1
+variants: 128
+preemptible: true
+max_tokens: 3_000_000_000  # 3B tokens（30M * 20 * 5 == 5xC scale）
+allow_repetition: true  # ⚠️ 必须启用：最小数据集仅 0.69B tokens（wrap_medium:low）
+sequence_length: 2048
+seed: 42
+temperature: 0.75  # 参考 dclm-datadelve-5xC-30m.yaml
+minimum_weight: 0.0001  # 参考标准配置
+min_strength: 0.1
+max_strength: 20
+sample_multiplier: 50  # 参考标准配置
+proxy_model_id: "olmo_30m"  # 30M 参数模型
+tokenizer: "openseek"  # OpenSeek tokenizer（vocab=151851, eos=151850）
+weka: false
+dtype: "uint32"  # OpenSeek 需要 uint32
+priority: low
+cluster: local
+device_batch_size: 32  # 修复：从 1 → 32（提升 GPU 利用率）
+
+sources:
+  - name: actual
+    topics:
+      - name: high
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-actual-actual-high_part_*_text_document/train-*.parquet
+      - name: medium_high
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-medium-actual-actual-high_part_*_text_document/train-*.parquet
+      - name: medium
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-actual-actual-mid_part_*_text_document/train-*.parquet
+      - name: medium_low
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-medium-actual-actual-low_part_*_text_document/train-*.parquet
+      - name: low
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-actual-actual-low_part_*_text_document/train-*.parquet
+
+  - name: distill
+    paths:
+      - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-synthetic-distill-high_part_*_text_document/train-*.parquet
+
+  - name: diverse_qa_pairs
+    paths:
+      - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-synthetic-diverse_qa_pairs-high_part_*_text_document/train-*.parquet
+
+  - name: extract_knowledge
+    paths:
+      - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-synthetic-extract_knowledge-high_part_*_text_document/train-*.parquet
+
+  - name: knowledge_list
+    paths:
+      - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-synthetic-knowledge_list-high_part_*_text_document/train-*.parquet
+
+  - name: wrap_medium
+    topics:
+      - name: high
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-high-synthetic-wrap_medium-high_part_*_text_document/train-*.parquet
+      - name: low
+        paths:
+          - /home/staff/jiayining/Datasets/OpenSeek-Pretrain-100B/Datasets/OpenSeek-Pretrain-100B_text/Nemotron-CC-low-synthetic-wrap_medium-low_part_*_text_document/train-*.parquet
+
+nonzero_weight:
+  - actual
+  - distill
+  - diverse_qa_pairs
+  - extract_knowledge
+  - knowledge_list
+  - wrap_medium
+
+# ============================================================================
+# 数据充足度分析（精确统计 - 读取 Parquet length 列）
+# 统计时间: 2026-02-12
+# 统计方法: scripts/count_tokens.py (100% 准确)
+# ============================================================================
+# Source                | Files  | Tokens(B) | 充足度 (vs 3B)
+# ----------------------|--------|-----------|----------------
+# wrap_medium:low       |    4   |   0.21    | ❌ 7%
+# knowledge_list        |    4   |   0.27    | ❌ 9%
+# distill               |    4   |   0.29    | ❌ 10%
+# actual:low            |    4   |   0.37    | ❌ 12%
+# extract_knowledge     |    5   |   0.48    | ❌ 16%
+# diverse_qa_pairs      |    5   |   0.56    | ❌ 19%
+# actual:medium_low     |    6   |   0.70    | ❌ 23%
+# actual:medium         |    7   |   0.80    | ❌ 27%
+# wrap_medium:high      |    7   |   0.85    | ❌ 28%
+# actual:high           |   10   |   1.14    | ❌ 38%
+# actual:medium_high    |   10   |   1.17    | ❌ 39%
+# ----------------------|--------|-----------|----------------
+# Total                 |   66   |   6.83    | 0.21x (总和)
+#
+# ⚠️ 关键结论：
+# - 所有 11 个子源全部严重不足 3B tokens（最大 1.17B，最小 0.21B）
+# - 之前估算方法（parquet_size × 1.4）误差 185%（错误估算 19.48B）
+# - 必须启用 allow_repetition=true（数据将循环 2.6x - 14.3x）
+# - minimum_weight=0.0001 防止小数据集过度重复
+

@@ -2,12 +2,19 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 from collections import defaultdict
 import yaml
-from beaker import Beaker
-from olmo_core.launch.beaker import BeakerEnvSecret, BeakerLaunchConfig, BeakerWekaBucket
-from olmo_core.utils import generate_uuid
+
+try:
+    from olmo_core.launch.beaker import BeakerEnvSecret, BeakerLaunchConfig, BeakerWekaBucket
+    _BEAKER_LAUNCH_IMPORT_ERROR: Optional[Exception] = None
+except ModuleNotFoundError as exc:
+    # Keep local utilities importable when beaker dependencies are unavailable.
+    BeakerEnvSecret = Any  # type: ignore[assignment]
+    BeakerLaunchConfig = Any  # type: ignore[assignment]
+    BeakerWekaBucket = Any  # type: ignore[assignment]
+    _BEAKER_LAUNCH_IMPORT_ERROR = exc
 
 from regmixer.aliases import (
     ExperimentConfig,
@@ -149,6 +156,11 @@ def mk_instance_cmd(
 
 def mk_launch_configs(group: ExperimentGroup, beaker_user: str) -> list[BeakerLaunchConfig]:
     """Build a beaker launch config from an experiment group."""
+    if _BEAKER_LAUNCH_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "Beaker launch dependencies are not installed. "
+            "Install beaker/olmo-core beaker extras to use launch commands."
+        ) from _BEAKER_LAUNCH_IMPORT_ERROR
 
     weka_buckets: List[BeakerWekaBucket] = []
     if group.config.weka:
