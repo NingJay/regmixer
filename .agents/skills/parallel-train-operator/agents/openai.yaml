@@ -1,0 +1,2 @@
+name: Parallel Train Operator
+description: Operate and monitor regmixer's shared-cluster training queue through scripts/parallel_train.py.

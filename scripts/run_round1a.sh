@@ -467,8 +467,16 @@ fi
 MIX_START=0
 MIX_END=14  # 15 variants (0-14)
 TOTAL_VARIANTS=$((MIX_END - MIX_START + 1))
-GPU_IDS="0,1,2,3,4,5,6,7"
+GPU_IDS="${ROUND1A_GPU_IDS:-0,1,2,3,4,5,6,7}"
+SCHEDULER_MODE="${ROUND1A_SCHEDULER_MODE:-local}"
+ROUND1A_HOSTS="${ROUND1A_HOSTS:-hpcgpu09,hpcgpu10,hpcgpu11,hpcgpu12,hpcgpu13,hpcgpu14,hpcgpu15}"
+PARALLEL_TRAIN_STATE_FILE="${OUTPUT_DIR}/parallel_train_state.json"
 GLOBAL_BATCH_SIZE=128
+
+if [[ "${SCHEDULER_MODE}" != "local" && "${SCHEDULER_MODE}" != "cluster" ]]; then
+  echo "[ERROR] ROUND1A_SCHEDULER_MODE must be 'local' or 'cluster'. Got: ${SCHEDULER_MODE}"
+  exit 1
+fi
 
 echo "============================================================================"
 echo "Round-1a: Actual 质量桶比例搜索"
@@ -476,11 +484,16 @@ echo "==========================================================================
 echo "Workdir: ${PROJECT_ROOT}"
 echo "Config: ${CONFIG_FILE}"
 echo "Variants: ${MIX_START}-${MIX_END} (${TOTAL_VARIANTS} total)"
-echo "GPUs: ${GPU_IDS}"
+echo "Scheduler mode: ${SCHEDULER_MODE}"
+echo "Allowed GPUs per host: ${GPU_IDS}"
+if [ "${SCHEDULER_MODE}" = "cluster" ]; then
+  echo "Host pool: ${ROUND1A_HOSTS}"
+fi
 echo "Start step: ${START_STEP}"
 echo "Output dir: ${OUTPUT_DIR}"
 echo "Train artifacts root: ${TRAIN_ROOT_DIR}"
 echo "Pipeline log: ${PIPELINE_LOG}"
+echo "Scheduler state: ${PARALLEL_TRAIN_STATE_FILE}"
 echo "============================================================================"
 echo ""
 
@@ -505,28 +518,41 @@ else
   echo ""
 fi
 
-# Step 2: 本地并行训练所有 variant，训练日志写到 logs/，摘要写到 summaries/。
+# Step 2: 并行训练所有 variant，训练日志写到 logs/，摘要写到 summaries/。
 if [ "${START_STEP}" -le 2 ]; then
-  echo "[Step 2/5] Training ${TOTAL_VARIANTS} variants (8 GPU parallel)..."
+  echo "[Step 2/5] Training ${TOTAL_VARIANTS} variants (${SCHEDULER_MODE} scheduler)..."
   echo "⚠️  This will take approximately 26-52 days (depending on throughput)"
   echo "    Use tmux/screen to keep the process running in background"
   echo ""
   read -p "Press Enter to start training (or Ctrl+C to cancel)..."
 
   export WANDB_MODE=offline
-  PYTHONPATH=src python scripts/parallel_train.py \
-    --config "${CONFIG_FILE}" \
-    --mix-file "${MIX_FILE}" \
-    --group-id "${GROUP_ID}" \
-    --run-name-prefix "${RUN_NAME_PREFIX}" \
-    --log-dir "${LOG_DIR}" \
-    --summary-dir "${SUMMARY_DIR}" \
-    --mix-start "${MIX_START}" \
-    --mix-end "${MIX_END}" \
-    --gpu-ids "${GPU_IDS}" \
-    --workdir "${PROJECT_ROOT}" \
-    --output-root-dir "${TRAIN_ROOT_DIR}" \
+  PARALLEL_TRAIN_CMD=(
+    python scripts/parallel_train.py
+    --scheduler-mode "${SCHEDULER_MODE}"
+    --config "${CONFIG_FILE}"
+    --mix-file "${MIX_FILE}"
+    --group-id "${GROUP_ID}"
+    --run-name-prefix "${RUN_NAME_PREFIX}"
+    --log-dir "${LOG_DIR}"
+    --summary-dir "${SUMMARY_DIR}"
+    --state-file "${PARALLEL_TRAIN_STATE_FILE}"
+    --mix-start "${MIX_START}"
+    --mix-end "${MIX_END}"
+    --gpu-ids "${GPU_IDS}"
+    --workdir "${PROJECT_ROOT}"
+    --output-root-dir "${TRAIN_ROOT_DIR}"
     --global-batch-size "${GLOBAL_BATCH_SIZE}"
+  )
+
+  if [ "${SCHEDULER_MODE}" = "cluster" ]; then
+    PARALLEL_TRAIN_CMD+=(
+      --hosts "${ROUND1A_HOSTS}"
+      --remote-workdir "${PROJECT_ROOT}"
+    )
+  fi
+
+  PYTHONPATH=src "${PARALLEL_TRAIN_CMD[@]}"
 
   echo "✓ Training completed"
   echo ""
