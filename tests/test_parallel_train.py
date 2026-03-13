@@ -3,6 +3,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def load_parallel_train_module():
     module_path = Path(__file__).resolve().parents[1] / "scripts" / "parallel_train.py"
@@ -93,6 +95,16 @@ def test_build_remote_task_command_contains_expected_remote_bootstrap(tmp_path):
     assert "CUDA_VISIBLE_DEVICES=3" in remote_body
     assert "WANDB_MODE=offline" in remote_body
     assert str(workdir / "scripts" / "run_local_variant.py") in task_cmd
+
+
+def test_run_remote_capture_times_out_probe(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise parallel_train.subprocess.TimeoutExpired(cmd="ssh hpcgpu12 ...", timeout=9)
+
+    monkeypatch.setattr(parallel_train.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match=r"ssh probe timed out for hpcgpu12 after 9s"):
+        parallel_train.run_remote_capture("hpcgpu12", "nvidia-smi", connect_timeout=5, probe_timeout=9)
 
 
 def test_state_file_tracks_started_and_completed_tasks(tmp_path):

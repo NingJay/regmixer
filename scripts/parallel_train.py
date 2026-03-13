@@ -20,6 +20,7 @@ DEFAULT_CLUSTER_HOSTS = "hpcgpu09,hpcgpu10,hpcgpu11,hpcgpu12,hpcgpu13,hpcgpu14,h
 DEFAULT_REMOTE_CONDA_ENV = "regmixer"
 DEFAULT_REMOTE_SHELL_INIT = "~/.bashrc"
 DEFAULT_PASSTHROUGH_ENV = "WANDB_MODE,REGMIXER_DISABLE_SWANLAB_SYNC"
+DEFAULT_SSH_PROBE_TIMEOUT = 15
 
 
 @dataclass(frozen=True)
@@ -193,6 +194,12 @@ def parse_args() -> argparse.Namespace:
         help="Per-host SSH connect timeout in seconds.",
     )
     parser.add_argument(
+        "--ssh-probe-timeout",
+        type=int,
+        default=DEFAULT_SSH_PROBE_TIMEOUT,
+        help="Execution timeout in seconds for remote probe commands such as nvidia-smi.",
+    )
+    parser.add_argument(
         "--passthrough-env",
         default=DEFAULT_PASSTHROUGH_ENV,
         help="Comma-separated env vars copied into remote task commands when present locally.",
@@ -326,13 +333,17 @@ def build_remote_bash_command(body: str) -> str:
     return f"bash -lc {shlex.quote(body)}"
 
 
-def run_remote_capture(host: str, body: str, connect_timeout: int) -> str:
-    proc = subprocess.run(
-        build_ssh_command(host, build_remote_bash_command(body), connect_timeout),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+def run_remote_capture(host: str, body: str, connect_timeout: int, probe_timeout: int) -> str:
+    try:
+        proc = subprocess.run(
+            build_ssh_command(host, build_remote_bash_command(body), connect_timeout),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=probe_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"ssh probe timed out for {host} after {probe_timeout}s") from exc
     if proc.returncode != 0:
         stderr = (proc.stderr or proc.stdout).strip()
         raise RuntimeError(f"ssh probe failed for {host}: {stderr or f'rc={proc.returncode}'}")
@@ -343,6 +354,7 @@ def discover_cluster_slots(
     hosts: Sequence[str],
     allowed_gpu_ids: Sequence[int],
     connect_timeout: int,
+    probe_timeout: int,
 ) -> Tuple[List[WorkerSlot], Dict[str, str]]:
     slots: List[WorkerSlot] = []
     scan_errors: Dict[str, str] = {}
@@ -351,8 +363,8 @@ def discover_cluster_slots(
 
     for host in hosts:
         try:
-            gpu_stdout = run_remote_capture(host, gpu_query, connect_timeout)
-            compute_stdout = run_remote_capture(host, compute_query, connect_timeout)
+            gpu_stdout = run_remote_capture(host, gpu_query, connect_timeout, probe_timeout)
+            compute_stdout = run_remote_capture(host, compute_query, connect_timeout, probe_timeout)
             gpu_snapshots = parse_nvidia_smi_gpu_output(gpu_stdout)
             busy_gpu_uuids = parse_nvidia_smi_compute_output(compute_stdout)
             host_slots, busy_gpu_ids = select_idle_slots(host, gpu_snapshots, busy_gpu_uuids, allowed_gpu_ids)
@@ -624,10 +636,11 @@ def build_worker_slots(
     hosts: Sequence[str],
     gpu_ids: Sequence[int],
     connect_timeout: int,
+    probe_timeout: int,
     max_workers: Optional[int],
 ) -> Tuple[List[WorkerSlot], Dict[str, str]]:
     if scheduler_mode == "cluster":
-        slots, scan_errors = discover_cluster_slots(hosts, gpu_ids, connect_timeout)
+        slots, scan_errors = discover_cluster_slots(hosts, gpu_ids, connect_timeout, probe_timeout)
         if max_workers is not None:
             slots = slots[:max_workers]
         if not slots:
@@ -690,6 +703,7 @@ def main() -> int:
         hosts=hosts,
         gpu_ids=gpu_ids,
         connect_timeout=args.ssh_connect_timeout,
+        probe_timeout=args.ssh_probe_timeout,
         max_workers=args.max_workers,
     )
 

@@ -8,6 +8,7 @@ Use this playbook when `parallel_train.py` is running in `cluster` mode and the 
 - Round1a pipeline log, if launched via `scripts/run_round1a.sh`
 - Per-mix logs in `outputs/<run>/logs/`
 - Per-mix summaries in `outputs/<run>/summaries/`
+- Runtime workdir used for the launch, usually `/home/staff/jiayining/LLM101-dicksuck-r2/regmixer` for real experiments
 
 ## Launch checklist
 
@@ -18,6 +19,7 @@ Use this playbook when `parallel_train.py` is running in `cluster` mode and the 
    - scheduler mode
    - host pool
    - allowed GPU ids
+   - runtime workdir
    - output root
 5. If the run is resumed, report the current running and failed mix indices.
 
@@ -41,6 +43,12 @@ Use this playbook when `parallel_train.py` is running in `cluster` mode and the 
 3. Per-mix summaries
    - newly completed variants
    - global step and save folder
+
+## Interpretation rules
+
+- Treat host probe timeouts in `scan_errors` as degraded capacity unless they leave the run with no usable slots.
+- If a mix log reaches model build, dataset materialization, checkpoint save, or forward/backward dry-run, the harness is no longer the primary suspect.
+- Use `.agents/docs/cluster-runtime-triage.md` when the failure class is unclear.
 
 ## Contact the user only when
 

@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -8,9 +9,17 @@ from olmo_core.data import (
     DataMix,
     NumpyDataLoaderConfig,
     NumpyDatasetConfig,
-    NumpyDatasetType,
     TokenizerConfig,
 )
+try:
+    from olmo_core.data import NumpyDatasetType
+except ImportError:
+    NumpyDatasetType = None
+
+try:
+    from olmo_core.data import NumpyFSLDatasetConfig
+except ImportError:
+    NumpyFSLDatasetConfig = None
 from olmo_core.distributed.parallel import DataParallelType
 from olmo_core.float8 import Float8Config
 from olmo_core.optim import OptimGroupOverride, SkipStepAdamWConfig
@@ -244,13 +253,23 @@ class TransformerConfigBuilder:
             lr /= 4
         return lr
 
-    def get_scheduler(self, model: TransformerConfig) -> Scheduler:
+    def get_scheduler(
+        self,
+        model: TransformerConfig,
+        total_training_steps: Optional[int] = None,
+    ) -> Scheduler:
         if self.train_type == TrainType.anneal:
             return LinearWithWarmup(warmup_steps=0, t_max=self.max_tokens)
 
-        return CosWithWarmupAndLinearDecay(
-            warmup_steps=self.get_warmup_steps(model.num_params),
-        )
+        warmup_steps = self.get_warmup_steps(model.num_params)
+        scheduler_kwargs = {"warmup_steps": warmup_steps}
+        if total_training_steps is not None:
+            clamped_total_steps = max(1, total_training_steps)
+            scheduler_kwargs["warmup_steps"] = min(warmup_steps, max(clamped_total_steps - 1, 0))
+            scheduler_kwargs["decay_steps"] = max(1, round(clamped_total_steps * 0.1))
+            scheduler_kwargs["decay_fraction"] = None
+
+        return CosWithWarmupAndLinearDecay(**scheduler_kwargs)
 
     def build_callbacks(self) -> Dict[str, Callback]:
         return {
@@ -289,6 +308,7 @@ class TransformerConfigBuilder:
             else self.get_batch_size(model.num_non_embedding_params)
         )
         learning_rate = self.get_lr(model, tokenizer)
+        total_training_steps = max(1, math.ceil(self.max_tokens / (global_batch_size * self.sequence_length)))
 
         mixture_config = MixtureBuilder(
             sources=self.sources,
@@ -300,15 +320,28 @@ class TransformerConfigBuilder:
             tokenizer=(
                 str(self.tokenizer.identifier) if self.tokenizer.identifier is not None else "dolma2"
             ),
+            global_batch_size=global_batch_size * self.sequence_length,
         ).build()
 
-        dataset_config = NumpyDatasetConfig(
-            source_mixture_config=mixture_config,
-            name=NumpyDatasetType.fsl,
-            sequence_length=self.sequence_length,
-            tokenizer=tokenizer,
-            work_dir=self.dataset_cache,
-        )
+        if NumpyDatasetType is not None:
+            dataset_config = NumpyDatasetConfig(
+                source_mixture_config=mixture_config,
+                name=NumpyDatasetType.fsl,
+                sequence_length=self.sequence_length,
+                tokenizer=tokenizer,
+                work_dir=self.dataset_cache,
+            )
+        elif NumpyFSLDatasetConfig is not None:
+            dataset_config = NumpyFSLDatasetConfig(
+                source_mixture_config=mixture_config,
+                sequence_length=self.sequence_length,
+                tokenizer=tokenizer,
+                work_dir=self.dataset_cache,
+            )
+        else:  # pragma: no cover - depends on external olmo_core package shape
+            raise ImportError(
+                "olmo_core.data is missing both NumpyDatasetType and NumpyFSLDatasetConfig"
+            )
 
         data_loader_config = NumpyDataLoaderConfig(
             global_batch_size=global_batch_size * self.sequence_length,
@@ -335,7 +368,7 @@ class TransformerConfigBuilder:
             float8_config=Float8Config(enabled=False),
             z_loss_multiplier=1e-5,
             max_grad_norm=1.0,
-            scheduler=self.get_scheduler(model),
+            scheduler=self.get_scheduler(model, total_training_steps=total_training_steps),
         )
 
         trainer_config = TrainerConfig(
