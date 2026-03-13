@@ -43,6 +43,15 @@ def test_parse_nvidia_smi_compute_output_ignores_empty_state():
     assert busy == set()
 
 
+def test_parse_gpu_ids_accepts_all():
+    assert parallel_train.parse_gpu_ids("all") is None
+
+
+def test_resolve_worker_limit_defaults_to_mix_count():
+    assert parallel_train.resolve_worker_limit(None, [0, 1, 2, 3]) == 4
+    assert parallel_train.resolve_worker_limit(2, [0, 1, 2, 3]) == 2
+
+
 def test_select_idle_slots_filters_busy_and_disallowed_gpu_ids():
     snapshots = [
         parallel_train.GpuSnapshot(gpu_id=0, gpu_uuid="GPU-0", memory_used_mb=0, utilization_gpu=0),
@@ -59,6 +68,42 @@ def test_select_idle_slots_filters_busy_and_disallowed_gpu_ids():
 
     assert [slot.label for slot in slots] == ["hpcgpu11:0"]
     assert busy_gpu_ids == [1]
+
+
+def test_select_idle_slots_uses_all_gpus_when_allowed_ids_are_omitted():
+    snapshots = [
+        parallel_train.GpuSnapshot(gpu_id=0, gpu_uuid="GPU-0", memory_used_mb=0, utilization_gpu=0),
+        parallel_train.GpuSnapshot(gpu_id=1, gpu_uuid="GPU-1", memory_used_mb=0, utilization_gpu=0),
+    ]
+
+    slots, busy_gpu_ids = parallel_train.select_idle_slots(
+        host="hpcgpu11",
+        gpu_snapshots=snapshots,
+        busy_gpu_uuids=set(),
+        allowed_gpu_ids=None,
+    )
+
+    assert [slot.label for slot in slots] == ["hpcgpu11:0", "hpcgpu11:1"]
+    assert busy_gpu_ids == []
+
+
+def test_build_worker_slots_discovers_local_gpus_when_gpu_ids_are_omitted(monkeypatch):
+    def fake_discover_local_gpu_ids():
+        return [0, 1, 2]
+
+    monkeypatch.setattr(parallel_train, "discover_local_gpu_ids", fake_discover_local_gpu_ids)
+
+    slots, scan_errors = parallel_train.build_worker_slots(
+        scheduler_mode="local",
+        hosts=[],
+        gpu_ids=None,
+        connect_timeout=5,
+        probe_timeout=5,
+        max_workers=2,
+    )
+
+    assert [slot.gpu_id for slot in slots] == [0, 1]
+    assert scan_errors == {}
 
 
 def test_build_remote_task_command_contains_expected_remote_bootstrap(tmp_path):

@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-"""Parallel regmixer variant scheduler for local and shared-cluster execution."""
+"""Parallel OLMES evaluation scheduler for local or shared-cluster execution."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import multiprocessing as mp
 import os
@@ -12,15 +13,38 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
 
 DEFAULT_CLUSTER_HOSTS = "hpcgpu09,hpcgpu10,hpcgpu11,hpcgpu12,hpcgpu13,hpcgpu14,hpcgpu15"
 DEFAULT_REMOTE_CONDA_ENV = "regmixer"
 DEFAULT_REMOTE_SHELL_INIT = "~/.bashrc"
-DEFAULT_PASSTHROUGH_ENV = "WANDB_MODE,REGMIXER_DISABLE_SWANLAB_SYNC"
+DEFAULT_PASSTHROUGH_ENV = "HF_HOME,HF_HUB_CACHE,HF_TOKEN,TRANSFORMERS_CACHE,XDG_CACHE_HOME"
 DEFAULT_SSH_PROBE_TIMEOUT = 15
+DEFAULT_MAX_RETRIES = 1
+
+DEFAULT_OLMES_TASKS: Tuple[str, ...] = (
+    "arc:rc::olmes:full",
+    "arc:rc:bpb::olmes:full",
+    "mmlu:rc::olmes",
+    "mmlu:rc:bpb::olmes",
+    "boolq:rc::olmes:full",
+    "boolq:rc:bpb::olmes:full",
+    "csqa:rc::olmes:full",
+    "csqa:rc:bpb::olmes:full",
+    "hellaswag:rc::olmes:full",
+    "hellaswag:rc:bpb::olmes:full",
+    "openbookqa:rc::olmes:full",
+    "openbookqa:rc:bpb::olmes:full",
+    "piqa:rc::olmes:full",
+    "piqa:rc:bpb::olmes:full",
+    "socialiqa:rc::olmes:full",
+    "socialiqa:rc:bpb::olmes:full",
+    "winogrande:rc::olmes:full",
+    "winogrande:rc:bpb::olmes:full",
+)
 
 
 @dataclass(frozen=True)
@@ -37,21 +61,24 @@ class WorkerSlot:
 
 
 @dataclass(frozen=True)
-class WorkerConfig:
+class GpuSnapshot:
+    gpu_id: int
+    gpu_uuid: str
+    memory_used_mb: int
+    utilization_gpu: int
+
+
+@dataclass(frozen=True)
+class EvalWorkerConfig:
     scheduler_mode: str
     workdir: str
-    python_bin: str
-    variant_script: str
-    config_path: str
-    mix_file: str
-    group_id: str
-    run_name_prefix: str
+    raw_results_dir: str
     log_dir: str
-    summary_dir: str
-    pythonpath: str
-    output_root_dir: Optional[str] = None
-    beaker_user: Optional[str] = None
-    global_batch_size: Optional[int] = None
+    batch_size: int
+    force_eval: bool
+    tasks: Tuple[str, ...]
+    olmes_bin: str = "olmes"
+    max_retries: int = DEFAULT_MAX_RETRIES
     remote_workdir: Optional[str] = None
     remote_conda_env: str = DEFAULT_REMOTE_CONDA_ENV
     remote_shell_init: str = DEFAULT_REMOTE_SHELL_INIT
@@ -60,45 +87,28 @@ class WorkerConfig:
 
 
 @dataclass(frozen=True)
-class TaskSpec:
+class EvalTask:
+    model_name: str
+    hf_model_dir: str
     mix_index: int
-    run_name: str
-    log_path: str
-    summary_path: str
-
-
-@dataclass(frozen=True)
-class GpuSnapshot:
-    gpu_id: int
-    gpu_uuid: str
-    memory_used_mb: int
-    utilization_gpu: int
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run regmixer mixes with a local or shared-cluster worker queue."
+        description="Run OLMES evaluations with a local or shared-cluster worker queue."
     )
-    parser.add_argument("--config", required=True, help="Path to regmixer YAML config.")
-    parser.add_argument("--mix-file", required=True, help="Path to generated mixes JSON.")
-    parser.add_argument("--group-id", required=True, help="Group id passed to run_local_variant.py.")
+    parser.add_argument("--hf-manifest", required=True, help="Path to eval/hf_models_manifest.csv.")
+    parser.add_argument("--raw-results-dir", required=True, help="Directory for eval/raw_olmes outputs.")
+    parser.add_argument("--log-dir", required=True, help="Directory for per-model eval logs.")
+    parser.add_argument("--batch-size", type=int, default=1, help="OLMES batch size.")
     parser.add_argument(
-        "--run-name-prefix",
-        default="parquet-e2e-fit-train",
-        help="Run name prefix. Full name is '<prefix>-<mix_index:04d>'.",
-    )
-    parser.add_argument(
-        "--mix-start",
+        "--force-eval",
         type=int,
         default=0,
-        help="First mix index (inclusive).",
+        help="Re-run evaluation even if metrics.json already exists (1=yes, 0=no).",
     )
-    parser.add_argument(
-        "--mix-end",
-        type=int,
-        default=11,
-        help="Last mix index (inclusive).",
-    )
+    parser.add_argument("--mix-start", type=int, default=0, help="First mix index (inclusive).")
+    parser.add_argument("--mix-end", type=int, default=14, help="Last mix index (inclusive).")
     parser.add_argument(
         "--scheduler-mode",
         choices=("local", "cluster"),
@@ -107,8 +117,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gpu-ids",
-        default="0,1,2,3,4,5,6,7",
-        help="Comma-separated GPU ids allowed per worker host.",
+        default="all",
+        help="Comma-separated GPU ids allowed per worker host, or 'all'.",
     )
     parser.add_argument(
         "--hosts",
@@ -132,50 +142,14 @@ def parse_args() -> argparse.Namespace:
         help="Shared remote working directory. Defaults to --workdir in cluster mode.",
     )
     parser.add_argument(
-        "--python-bin",
-        default=None,
-        help="Python executable for run_local_variant.py. Defaults to local sys.executable or remote 'python'.",
-    )
-    parser.add_argument(
-        "--variant-script",
-        default="scripts/run_local_variant.py",
-        help="Path to run_local_variant.py relative to workdir or absolute.",
-    )
-    parser.add_argument(
-        "--pythonpath",
-        default="src",
-        help="PYTHONPATH injected to each task subprocess.",
-    )
-    parser.add_argument(
-        "--log-dir",
-        default="outputs/dryfit_fit/logs",
-        help="Directory for per-task logs.",
-    )
-    parser.add_argument(
-        "--summary-dir",
-        default="outputs/dryfit_fit/summaries",
-        help="Directory for per-task summaries.",
+        "--olmes-bin",
+        default="olmes",
+        help="OLMES executable used for each task.",
     )
     parser.add_argument(
         "--state-file",
         default=None,
-        help="Path to incremental scheduler state JSON. Defaults to <summary-dir>/../parallel_train_state.json.",
-    )
-    parser.add_argument(
-        "--output-root-dir",
-        default=None,
-        help="Optional root directory for training artifacts (replaces /tmp defaults).",
-    )
-    parser.add_argument(
-        "--beaker-user",
-        default=None,
-        help="Optional pass-through to run_local_variant.py --beaker-user.",
-    )
-    parser.add_argument(
-        "--global-batch-size",
-        type=int,
-        default=None,
-        help="Optional pass-through to run_local_variant.py --global-batch-size.",
+        help="Path to incremental scheduler state JSON. Defaults to <log-dir>/../parallel_eval_state.json.",
     )
     parser.add_argument(
         "--remote-conda-env",
@@ -204,6 +178,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_PASSTHROUGH_ENV,
         help="Comma-separated env vars copied into remote task commands when present locally.",
     )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help="Maximum retries for failed or incomplete tasks.",
+    )
     return parser.parse_args()
 
 
@@ -230,26 +210,10 @@ def parse_hosts(raw: str) -> List[str]:
     return hosts
 
 
-def build_mix_indices(start: int, end: int) -> List[int]:
-    if start < 0:
-        raise ValueError(f"mix-start must be >= 0, got {start}")
-    if end < start:
-        raise ValueError(f"mix-end({end}) must be >= mix-start({start})")
-    return list(range(start, end + 1))
-
-
-def resolve_worker_limit(requested_max_workers: Optional[int], mix_indices: Sequence[int]) -> int:
+def resolve_worker_limit(requested_max_workers: Optional[int], tasks: Sequence[EvalTask]) -> int:
     if requested_max_workers is not None:
         return requested_max_workers
-    return len(mix_indices)
-
-
-def resolve_python_bin(scheduler_mode: str, python_bin: Optional[str]) -> str:
-    if python_bin:
-        return python_bin
-    if scheduler_mode == "cluster":
-        return "python"
-    return sys.executable
+    return len(tasks)
 
 
 def resolve_path(value: str, base_dir: str) -> str:
@@ -259,8 +223,8 @@ def resolve_path(value: str, base_dir: str) -> str:
     return str((Path(base_dir) / path).resolve())
 
 
-def default_state_file(summary_dir: str) -> str:
-    return str(Path(summary_dir).parent / "parallel_train_state.json")
+def default_state_file(log_dir: str) -> str:
+    return str(Path(log_dir).parent / "parallel_eval_state.json")
 
 
 def parse_nvidia_smi_gpu_output(stdout: str) -> List[GpuSnapshot]:
@@ -404,49 +368,107 @@ def discover_cluster_slots(
     return slots, scan_errors
 
 
-def build_command(cfg: WorkerConfig, mix_index: int, run_name: str, summary_out: str) -> List[str]:
-    cmd: List[str] = [
-        cfg.python_bin,
-        cfg.variant_script,
-        "--config",
-        cfg.config_path,
-        "--mix-file",
-        cfg.mix_file,
-        "--mix-index",
-        str(mix_index),
-        "--run-name",
-        run_name,
-        "--group-id",
-        cfg.group_id,
-        "--summary-out",
-        summary_out,
+def build_task_list(hf_manifest: str, mix_start: int, mix_end: int) -> List[EvalTask]:
+    manifest_path = Path(hf_manifest)
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"HF manifest does not exist: {hf_manifest}")
+
+    tasks: List[EvalTask] = []
+    with manifest_path.open(encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            mix_idx = int(row["mix_index"])
+            if not (mix_start <= mix_idx <= mix_end):
+                continue
+            hf_model_dir = row["hf_model_dir"].strip()
+            hf_model_path = Path(hf_model_dir)
+            if not hf_model_path.is_absolute():
+                hf_model_path = (manifest_path.parent / hf_model_path).resolve()
+            tasks.append(
+                EvalTask(
+                    model_name=hf_model_path.name,
+                    hf_model_dir=str(hf_model_path),
+                    mix_index=mix_idx,
+                )
+            )
+
+    if not tasks:
+        raise ValueError(f"Found no tasks in {hf_manifest} for mix range {mix_start}-{mix_end}")
+    return tasks
+
+
+def verify_metrics_complete(metrics_file: Path, expected_tasks: int = len(DEFAULT_OLMES_TASKS)) -> bool:
+    if not metrics_file.exists():
+        return False
+
+    try:
+        with metrics_file.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return False
+
+    tasks = data.get("tasks")
+    return isinstance(tasks, list) and len(tasks) >= expected_tasks
+
+
+def is_oom_error(log_file: Path) -> bool:
+    if not log_file.exists():
+        return False
+
+    try:
+        log_content = log_file.read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+
+    oom_patterns = (
+        "out of memory",
+        "cuda out of memory",
+        "cuda error: out of memory",
+    )
+    return any(pattern in log_content for pattern in oom_patterns)
+
+
+def build_eval_command(cfg: EvalWorkerConfig, task: EvalTask, output_dir: str) -> List[str]:
+    return [
+        cfg.olmes_bin,
+        "--model",
+        task.model_name,
+        "--model-type",
+        "hf",
+        "--model-args",
+        f"model_path={task.hf_model_dir},trust_remote_code=True,add_bos_token=True,max_length=8192",
+        "--task",
+        *cfg.tasks,
+        "--batch-size",
+        str(cfg.batch_size),
+        "--gpus",
+        "1",
+        "--output-dir",
+        output_dir,
     ]
-    if cfg.output_root_dir:
-        cmd.extend(["--output-root-dir", cfg.output_root_dir])
-    if cfg.beaker_user:
-        cmd.extend(["--beaker-user", cfg.beaker_user])
-    if cfg.global_batch_size is not None:
-        cmd.extend(["--global-batch-size", str(cfg.global_batch_size)])
-    return cmd
 
 
-def build_task_env(cfg: WorkerConfig, slot: WorkerSlot) -> Dict[str, str]:
+def build_task_env(cfg: EvalWorkerConfig, slot: WorkerSlot) -> Dict[str, str]:
     env = {
-        "PYTHONPATH": cfg.pythonpath,
         "CUDA_VISIBLE_DEVICES": str(slot.gpu_id),
-        "MASTER_PORT": str(29541 + slot.gpu_id),
-        "TORCH_DISTRIBUTED_DEFAULT_PORT": str(29542 + slot.gpu_id),
+        "HF_DATASETS_TRUST_REMOTE_CODE": "1",
+        "DATASETS_TRUST_REMOTE_CODE": "1",
     }
     if cfg.passthrough_env:
         env.update(cfg.passthrough_env)
     return env
 
 
-def build_remote_task_command(cfg: WorkerConfig, slot: WorkerSlot, task: TaskSpec) -> Tuple[str, str]:
+def build_remote_task_command(
+    cfg: EvalWorkerConfig,
+    slot: WorkerSlot,
+    task: EvalTask,
+    output_dir: str,
+) -> Tuple[str, str]:
     remote_workdir = cfg.remote_workdir or cfg.workdir
     env = build_task_env(cfg, slot)
     env_prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
-    task_cmd = shlex.join(build_command(cfg, task.mix_index, task.run_name, task.summary_path))
+    task_cmd = shlex.join(build_eval_command(cfg, task, output_dir))
     init_script = cfg.remote_shell_init
     if not init_script.startswith(("~", "$")):
         init_script = shlex.quote(init_script)
@@ -460,52 +482,87 @@ def build_remote_task_command(cfg: WorkerConfig, slot: WorkerSlot, task: TaskSpe
     return body, task_cmd
 
 
-def build_task_spec(cfg: WorkerConfig, mix_index: int) -> TaskSpec:
-    idx = f"{mix_index:04d}"
-    run_name = f"{cfg.run_name_prefix}-{idx}"
-    log_path = str(Path(cfg.log_dir) / f"{run_name}.log")
-    summary_path = str(Path(cfg.summary_dir) / f"{run_name}.json")
-    return TaskSpec(
-        mix_index=mix_index,
-        run_name=run_name,
-        log_path=log_path,
-        summary_path=summary_path,
-    )
-
-
-def build_started_event(slot: WorkerSlot, task: TaskSpec) -> Dict[str, Any]:
+def build_started_event(slot: WorkerSlot, task: EvalTask, log_path: str, output_dir: str) -> Dict[str, Any]:
     return {
         "event": "started",
+        "model_name": task.model_name,
         "mix_index": task.mix_index,
-        "run_name": task.run_name,
+        "hf_model_dir": task.hf_model_dir,
         "host": slot.host,
         "gpu_id": slot.gpu_id,
         "gpu_uuid": slot.gpu_uuid,
-        "log_path": task.log_path,
-        "summary_path": task.summary_path,
+        "log_path": log_path,
+        "output_dir": output_dir,
         "started_at": time.time(),
     }
 
 
-def run_single_task(slot: WorkerSlot, task: TaskSpec, cfg: WorkerConfig) -> Dict[str, Any]:
-    log_path = Path(task.log_path)
-    summary_path = Path(task.summary_path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
+def complete_event(
+    status: str,
+    slot: WorkerSlot,
+    task: EvalTask,
+    log_path: str,
+    output_dir: str,
+    return_code: int,
+    duration_sec: float,
+    error: str = "",
+) -> Dict[str, Any]:
+    return {
+        "event": "completed",
+        "status": status,
+        "model_name": task.model_name,
+        "mix_index": task.mix_index,
+        "hf_model_dir": task.hf_model_dir,
+        "host": slot.host,
+        "gpu_id": slot.gpu_id,
+        "gpu_uuid": slot.gpu_uuid,
+        "return_code": return_code,
+        "duration_sec": round(duration_sec, 2),
+        "log_path": log_path,
+        "output_dir": output_dir,
+        "error": error,
+        "completed_at": time.time(),
+    }
+
+
+def run_single_eval_task(
+    slot: WorkerSlot,
+    task: EvalTask,
+    cfg: EvalWorkerConfig,
+    retry_count: int = 0,
+) -> Dict[str, Any]:
+    output_dir = str(Path(cfg.raw_results_dir) / task.model_name)
+    metrics_file = Path(output_dir) / "metrics.json"
+    log_file = Path(cfg.log_dir) / f"eval-{task.model_name}.log"
+
+    if metrics_file.exists() and not cfg.force_eval:
+        if verify_metrics_complete(metrics_file, expected_tasks=len(cfg.tasks)):
+            return complete_event(
+                status="cached",
+                slot=slot,
+                task=task,
+                log_path=str(log_file),
+                output_dir=output_dir,
+                return_code=0,
+                duration_sec=0.0,
+            )
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
 
     env = build_task_env(cfg, slot)
-    task_cmd = shlex.join(build_command(cfg, task.mix_index, task.run_name, task.summary_path))
+    task_cmd = shlex.join(build_eval_command(cfg, task, output_dir))
+
     exec_cmd: List[str]
     proc_env: Optional[Dict[str, str]]
     cwd: Optional[str]
-
     if cfg.scheduler_mode == "cluster":
-        remote_body, task_cmd = build_remote_task_command(cfg, slot, task)
+        remote_body, task_cmd = build_remote_task_command(cfg, slot, task, output_dir)
         exec_cmd = build_ssh_command(slot.host, build_remote_bash_command(remote_body), cfg.ssh_connect_timeout)
         proc_env = None
         cwd = None
     else:
-        exec_cmd = build_command(cfg, task.mix_index, task.run_name, task.summary_path)
+        exec_cmd = build_eval_command(cfg, task, output_dir)
         proc_env = os.environ.copy()
         proc_env.update(env)
         cwd = cfg.workdir
@@ -515,21 +572,21 @@ def run_single_task(slot: WorkerSlot, task: TaskSpec, cfg: WorkerConfig) -> Dict
     error_message = ""
 
     try:
-        with log_path.open("w", encoding="utf-8") as logf:
+        with log_file.open("w", encoding="utf-8") as logf:
             logf.write(
-                f"[scheduler] mode={cfg.scheduler_mode} host={slot.host} gpu_id={slot.gpu_id} mix_index={task.mix_index}\n"
+                f"[eval_scheduler] mode={cfg.scheduler_mode} host={slot.host} gpu_id={slot.gpu_id} "
+                f"model={task.model_name} mix_index={task.mix_index}\n"
             )
             if slot.gpu_uuid:
-                logf.write(f"[scheduler] gpu_uuid={slot.gpu_uuid}\n")
-            logf.write(f"[scheduler] task_command={task_cmd}\n")
+                logf.write(f"[eval_scheduler] gpu_uuid={slot.gpu_uuid}\n")
+            logf.write(f"[eval_scheduler] task_command={task_cmd}\n")
             logf.write(
-                "[scheduler] env "
+                "[eval_scheduler] env "
                 f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} "
-                f"MASTER_PORT={env['MASTER_PORT']} "
-                f"TORCH_DISTRIBUTED_DEFAULT_PORT={env['TORCH_DISTRIBUTED_DEFAULT_PORT']}\n"
+                f"HF_DATASETS_TRUST_REMOTE_CODE={env['HF_DATASETS_TRUST_REMOTE_CODE']}\n"
             )
             if cfg.scheduler_mode == "cluster":
-                logf.write(f"[scheduler] ssh_command={shlex.join(exec_cmd)}\n")
+                logf.write(f"[eval_scheduler] ssh_command={shlex.join(exec_cmd)}\n")
             logf.flush()
             proc = subprocess.run(
                 exec_cmd,
@@ -543,41 +600,81 @@ def run_single_task(slot: WorkerSlot, task: TaskSpec, cfg: WorkerConfig) -> Dict
     except Exception as exc:  # pragma: no cover - defensive runtime guard
         error_message = f"{type(exc).__name__}: {exc}"
         try:
-            with log_path.open("a", encoding="utf-8") as logf:
-                logf.write(f"[scheduler] exception={error_message}\n")
+            with log_file.open("a", encoding="utf-8") as logf:
+                logf.write(f"[eval_scheduler] exception={error_message}\n")
         except OSError:
             pass
+        return complete_event(
+            status="failed",
+            slot=slot,
+            task=task,
+            log_path=str(log_file),
+            output_dir=output_dir,
+            return_code=return_code,
+            duration_sec=time.time() - start_ts,
+            error=error_message,
+        )
 
-    duration_sec = round(time.time() - start_ts, 2)
-    return {
-        "event": "completed",
-        "mix_index": task.mix_index,
-        "gpu_id": slot.gpu_id,
-        "gpu_uuid": slot.gpu_uuid,
-        "host": slot.host,
-        "run_name": task.run_name,
-        "log_path": task.log_path,
-        "summary_path": task.summary_path,
-        "return_code": return_code,
-        "duration_sec": duration_sec,
-        "error": error_message,
-        "completed_at": time.time(),
-    }
+    duration_sec = time.time() - start_ts
+
+    if return_code == 0:
+        if verify_metrics_complete(metrics_file, expected_tasks=len(cfg.tasks)):
+            return complete_event(
+                status="success",
+                slot=slot,
+                task=task,
+                log_path=str(log_file),
+                output_dir=output_dir,
+                return_code=return_code,
+                duration_sec=duration_sec,
+            )
+        if retry_count < cfg.max_retries:
+            time.sleep(60)
+            return run_single_eval_task(slot, task, cfg, retry_count + 1)
+        return complete_event(
+            status="incomplete",
+            slot=slot,
+            task=task,
+            log_path=str(log_file),
+            output_dir=output_dir,
+            return_code=return_code,
+            duration_sec=duration_sec,
+            error="metrics.json is incomplete",
+        )
+
+    if is_oom_error(log_file) and cfg.batch_size > 1 and retry_count == 0:
+        cfg_retry = replace(cfg, batch_size=1)
+        return run_single_eval_task(slot, task, cfg_retry, retry_count=1)
+
+    if retry_count < cfg.max_retries:
+        time.sleep(60 * (2 ** retry_count))
+        return run_single_eval_task(slot, task, cfg, retry_count + 1)
+
+    return complete_event(
+        status="failed",
+        slot=slot,
+        task=task,
+        log_path=str(log_file),
+        output_dir=output_dir,
+        return_code=return_code,
+        duration_sec=duration_sec,
+    )
 
 
 def worker_loop(
     slot: WorkerSlot,
-    task_queue: "mp.Queue[Optional[int]]",
+    task_queue: "mp.Queue[Optional[EvalTask]]",
     event_queue: "mp.Queue[Dict[str, Any]]",
-    cfg: WorkerConfig,
+    cfg: EvalWorkerConfig,
 ) -> None:
     while True:
-        mix_index = task_queue.get()
-        if mix_index is None:
+        task = task_queue.get()
+        if task is None:
             return
-        task = build_task_spec(cfg, mix_index)
-        event_queue.put(build_started_event(slot, task))
-        event_queue.put(run_single_task(slot, task, cfg))
+        output_dir = str(Path(cfg.raw_results_dir) / task.model_name)
+        log_path = str(Path(cfg.log_dir) / f"eval-{task.model_name}.log")
+        event_queue.put(build_started_event(slot, task, log_path, output_dir))
+        event_queue.put(run_single_eval_task(slot, task, cfg))
 
 
 def build_passthrough_env(raw: str) -> Dict[str, str]:
@@ -589,20 +686,21 @@ def build_passthrough_env(raw: str) -> Dict[str, str]:
 
 
 def initialize_state(
-    cfg: WorkerConfig,
+    cfg: EvalWorkerConfig,
     slots: Sequence[WorkerSlot],
-    mix_indices: Sequence[int],
+    tasks: Sequence[EvalTask],
+    hf_manifest: str,
     scan_errors: Dict[str, str],
 ) -> Dict[str, Any]:
     return {
         "scheduler_mode": cfg.scheduler_mode,
         "workdir": cfg.workdir,
-        "config_path": cfg.config_path,
-        "mix_file": cfg.mix_file,
-        "group_id": cfg.group_id,
-        "mix_indices": list(mix_indices),
+        "hf_manifest": hf_manifest,
+        "raw_results_dir": cfg.raw_results_dir,
+        "log_dir": cfg.log_dir,
         "scan_errors": scan_errors,
         "slots": [asdict(slot) for slot in slots],
+        "task_mix_indices": [task.mix_index for task in tasks],
         "tasks": {},
         "updated_at": time.time(),
     }
@@ -616,12 +714,13 @@ def apply_event_to_state(state: Dict[str, Any], event: Dict[str, Any]) -> None:
     if event["event"] == "started":
         task_state.update(
             {
-                "run_name": event["run_name"],
+                "model_name": event["model_name"],
+                "hf_model_dir": event["hf_model_dir"],
                 "host": event["host"],
                 "gpu_id": event["gpu_id"],
                 "gpu_uuid": event.get("gpu_uuid"),
                 "log_path": event["log_path"],
-                "summary_path": event["summary_path"],
+                "output_dir": event["output_dir"],
                 "status": "running",
                 "started_at": event["started_at"],
             }
@@ -629,17 +728,18 @@ def apply_event_to_state(state: Dict[str, Any], event: Dict[str, Any]) -> None:
     elif event["event"] == "completed":
         task_state.update(
             {
-                "run_name": event["run_name"],
+                "model_name": event["model_name"],
+                "hf_model_dir": event["hf_model_dir"],
                 "host": event["host"],
                 "gpu_id": event["gpu_id"],
                 "gpu_uuid": event.get("gpu_uuid"),
                 "log_path": event["log_path"],
-                "summary_path": event["summary_path"],
+                "output_dir": event["output_dir"],
                 "return_code": event["return_code"],
                 "duration_sec": event["duration_sec"],
                 "error": event["error"],
                 "completed_at": event["completed_at"],
-                "status": "succeeded" if int(event["return_code"]) == 0 else "failed",
+                "status": event["status"],
             }
         )
     else:
@@ -691,34 +791,30 @@ def validate_cluster_mode_paths(workdir: str, remote_workdir: Optional[str]) -> 
 
 def main() -> int:
     args = parse_args()
-    mix_indices = build_mix_indices(args.mix_start, args.mix_end)
+    tasks = build_task_list(args.hf_manifest, args.mix_start, args.mix_end)
     gpu_ids = parse_gpu_ids(args.gpu_ids)
-    worker_limit = resolve_worker_limit(args.max_workers, mix_indices)
+    worker_limit = resolve_worker_limit(args.max_workers, tasks)
     hosts = parse_hosts(args.hosts)
 
     workdir = str(Path(args.workdir).resolve())
     if args.scheduler_mode == "cluster":
         validate_cluster_mode_paths(workdir, args.remote_workdir)
 
+    resolved_manifest = resolve_path(args.hf_manifest, workdir)
+    resolved_raw_results_dir = resolve_path(args.raw_results_dir, workdir)
     resolved_log_dir = resolve_path(args.log_dir, workdir)
-    resolved_summary_dir = resolve_path(args.summary_dir, workdir)
-    state_file = resolve_path(args.state_file, workdir) if args.state_file else default_state_file(resolved_summary_dir)
+    state_file = resolve_path(args.state_file, workdir) if args.state_file else default_state_file(resolved_log_dir)
 
-    cfg = WorkerConfig(
+    cfg = EvalWorkerConfig(
         scheduler_mode=args.scheduler_mode,
         workdir=workdir,
-        python_bin=resolve_python_bin(args.scheduler_mode, args.python_bin),
-        variant_script=resolve_path(args.variant_script, workdir),
-        config_path=resolve_path(args.config, workdir),
-        mix_file=resolve_path(args.mix_file, workdir),
-        group_id=args.group_id,
-        run_name_prefix=args.run_name_prefix,
+        raw_results_dir=resolved_raw_results_dir,
         log_dir=resolved_log_dir,
-        summary_dir=resolved_summary_dir,
-        pythonpath=args.pythonpath,
-        output_root_dir=resolve_path(args.output_root_dir, workdir) if args.output_root_dir else None,
-        beaker_user=args.beaker_user,
-        global_batch_size=args.global_batch_size,
+        batch_size=args.batch_size,
+        force_eval=bool(args.force_eval),
+        tasks=DEFAULT_OLMES_TASKS,
+        olmes_bin=args.olmes_bin,
+        max_retries=args.max_retries,
         remote_workdir=args.remote_workdir or workdir,
         remote_conda_env=args.remote_conda_env,
         remote_shell_init=args.remote_shell_init,
@@ -736,20 +832,21 @@ def main() -> int:
     )
 
     print(
-        f"[scheduler] mode={cfg.scheduler_mode} workers={len(slots)} "
-        f"target_workers={worker_limit} mixes={len(mix_indices)}"
+        f"[eval_scheduler] mode={cfg.scheduler_mode} workers={len(slots)} "
+        f"target_workers={worker_limit} models={len(tasks)}"
     )
     if cfg.scheduler_mode == "cluster":
-        print("[scheduler] slots=" + ",".join(slot.label for slot in slots))
+        print("[eval_scheduler] slots=" + ",".join(slot.label for slot in slots))
+    print(f"[eval_scheduler] tasks_per_model={len(cfg.tasks)} batch_size={cfg.batch_size} force_eval={cfg.force_eval}")
 
-    state = initialize_state(cfg, slots, mix_indices, scan_errors)
+    state = initialize_state(cfg, slots, tasks, resolved_manifest, scan_errors)
     write_state_file(state_file, state)
 
-    task_queue: "mp.Queue[Optional[int]]" = mp.Queue()
+    task_queue: "mp.Queue[Optional[EvalTask]]" = mp.Queue()
     event_queue: "mp.Queue[Dict[str, Any]]" = mp.Queue()
 
-    for mix_index in mix_indices:
-        task_queue.put(mix_index)
+    for task in tasks:
+        task_queue.put(task)
     for _ in slots:
         task_queue.put(None)
 
@@ -763,7 +860,7 @@ def main() -> int:
     completed = 0
 
     try:
-        while completed < len(mix_indices):
+        while completed < len(tasks):
             event = event_queue.get()
             apply_event_to_state(state, event)
             write_state_file(state_file, state)
@@ -773,11 +870,20 @@ def main() -> int:
 
             completed += 1
             results.append(event)
-            ok = int(event["return_code"]) == 0
-            status = "OK" if ok else "FAIL"
+
+            status = event["status"]
+            if status == "success":
+                label = "OK"
+            elif status == "cached":
+                label = "CACHED"
+            else:
+                label = status.upper()
+
+            duration_str = f"{event.get('duration_sec', 0):.1f}s"
             print(
-                f"[{status}] mix={event['mix_index']:04d} host={event['host']} gpu={event['gpu_id']} "
-                f"rc={event['return_code']} log={event['log_path']}"
+                f"[{label}] {event['model_name']} mix={event['mix_index']:02d} "
+                f"host={event['host']} gpu={event['gpu_id']} time={duration_str} "
+                f"log={event['log_path']}"
             )
     except KeyboardInterrupt:
         state["interrupted"] = True
@@ -789,20 +895,26 @@ def main() -> int:
             proc.join()
 
     results.sort(key=lambda item: int(item["mix_index"]))
-    failed = [result for result in results if int(result["return_code"]) != 0]
+    failed = [result for result in results if result["status"] == "failed"]
+    incomplete = [result for result in results if result["status"] == "incomplete"]
+    cached = [result for result in results if result["status"] == "cached"]
+    success = [result for result in results if result["status"] == "success"]
+
     report = {
         "scheduler_mode": cfg.scheduler_mode,
         "state_file": state_file,
         "total": len(results),
-        "succeeded": len(results) - len(failed),
+        "success": len(success),
+        "cached": len(cached),
+        "incomplete": len(incomplete),
         "failed": len(failed),
-        "failed_mix_indices": [int(result["mix_index"]) for result in failed],
+        "failed_mix_indices": [int(result["mix_index"]) for result in failed + incomplete],
         "slots": [slot.label for slot in slots],
         "scan_errors": scan_errors,
-        "failures": failed,
+        "failures": failed + incomplete,
     }
     print(json.dumps(report, ensure_ascii=True, indent=2))
-    return 1 if failed else 0
+    return 1 if (failed or incomplete) else 0
 
 
 if __name__ == "__main__":

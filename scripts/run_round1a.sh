@@ -91,6 +91,11 @@
 # Optional:
 #   ROUND1A_TRAIN_ROOT_DIR=/path/to/train-artifacts
 #   ROUND1A_START_STEP=3  # 从 convert-hf 开始恢复
+#   EVAL_SCHEDULER_MODE=cluster  # Step 4 默认跨 hpcgpu09-15 扫卡
+#   EVAL_HOSTS="hpcgpu09,hpcgpu10,..."  # Step 4 共享 host pool（默认复用 ROUND1A_HOSTS）
+#   EVAL_GPU_IDS="all"  # 并行评测使用的 GPU（默认：每台 host 自动发现全部可用 GPU）
+#   OLMES_BATCH_SIZE=1  # OLMES 评测 batch size（默认：1）
+#   ROUND1A_FORCE_EVAL=0  # 即使 metrics.json 存在也重新评测（1=强制，0=复用，默认：0）
 # ============================================================================
 
 set -e
@@ -467,14 +472,22 @@ fi
 MIX_START=0
 MIX_END=14  # 15 variants (0-14)
 TOTAL_VARIANTS=$((MIX_END - MIX_START + 1))
-GPU_IDS="${ROUND1A_GPU_IDS:-0,1,2,3,4,5,6,7}"
+GPU_IDS="${ROUND1A_GPU_IDS:-all}"
 SCHEDULER_MODE="${ROUND1A_SCHEDULER_MODE:-local}"
 ROUND1A_HOSTS="${ROUND1A_HOSTS:-hpcgpu09,hpcgpu10,hpcgpu11,hpcgpu12,hpcgpu13,hpcgpu14,hpcgpu15}"
 PARALLEL_TRAIN_STATE_FILE="${OUTPUT_DIR}/parallel_train_state.json"
+PARALLEL_EVAL_STATE_FILE="${OUTPUT_DIR}/parallel_eval_state.json"
 GLOBAL_BATCH_SIZE=128
+EVAL_SCHEDULER_MODE="${EVAL_SCHEDULER_MODE:-cluster}"
+EVAL_HOSTS="${EVAL_HOSTS:-${ROUND1A_HOSTS}}"
 
 if [[ "${SCHEDULER_MODE}" != "local" && "${SCHEDULER_MODE}" != "cluster" ]]; then
   echo "[ERROR] ROUND1A_SCHEDULER_MODE must be 'local' or 'cluster'. Got: ${SCHEDULER_MODE}"
+  exit 1
+fi
+
+if [[ "${EVAL_SCHEDULER_MODE}" != "local" && "${EVAL_SCHEDULER_MODE}" != "cluster" ]]; then
+  echo "[ERROR] EVAL_SCHEDULER_MODE must be 'local' or 'cluster'. Got: ${EVAL_SCHEDULER_MODE}"
   exit 1
 fi
 
@@ -485,15 +498,21 @@ echo "Workdir: ${PROJECT_ROOT}"
 echo "Config: ${CONFIG_FILE}"
 echo "Variants: ${MIX_START}-${MIX_END} (${TOTAL_VARIANTS} total)"
 echo "Scheduler mode: ${SCHEDULER_MODE}"
-echo "Allowed GPUs per host: ${GPU_IDS}"
+echo "GPU selection: ${GPU_IDS}"
 if [ "${SCHEDULER_MODE}" = "cluster" ]; then
   echo "Host pool: ${ROUND1A_HOSTS}"
+  echo "Target immediate workers: ${TOTAL_VARIANTS} (one per variant when enough idle GPUs exist)"
 fi
 echo "Start step: ${START_STEP}"
 echo "Output dir: ${OUTPUT_DIR}"
 echo "Train artifacts root: ${TRAIN_ROOT_DIR}"
 echo "Pipeline log: ${PIPELINE_LOG}"
 echo "Scheduler state: ${PARALLEL_TRAIN_STATE_FILE}"
+echo "Eval scheduler mode: ${EVAL_SCHEDULER_MODE}"
+echo "Eval scheduler state: ${PARALLEL_EVAL_STATE_FILE}"
+if [ "${EVAL_SCHEDULER_MODE}" = "cluster" ]; then
+  echo "Eval host pool: ${EVAL_HOSTS}"
+fi
 echo "============================================================================"
 echo ""
 
@@ -521,6 +540,8 @@ fi
 # Step 2: 并行训练所有 variant，训练日志写到 logs/，摘要写到 summaries/。
 if [ "${START_STEP}" -le 2 ]; then
   echo "[Step 2/5] Training ${TOTAL_VARIANTS} variants (${SCHEDULER_MODE} scheduler)..."
+  echo "[INFO] Scheduler will try to start up to ${TOTAL_VARIANTS} workers immediately."
+  echo "[INFO] If fewer idle GPUs are available, remaining variants will queue automatically."
   echo "⚠️  This will take approximately 26-52 days (depending on throughput)"
   echo "    Use tmux/screen to keep the process running in background"
   echo ""
@@ -581,21 +602,40 @@ else
   echo ""
 fi
 
-# Step 4: 逐个 HF checkpoint 跑 OLMES，然后把 raw_olmes 聚合成 eval_metrics.csv。
+# Step 4: 并行 HF checkpoint OLMES 评测，然后把 raw_olmes 聚合成 eval_metrics.csv。
 if [ "${START_STEP}" -le 4 ]; then
-  echo "[Step 4/5] Evaluating all variants with OLMES..."
-  while IFS=, read -r run_name mix_index global_step checkpoint_step_dir hf_model_dir; do
-    [ -z "${run_name}" ] && continue
-    hf_model_dir="${hf_model_dir%$'\r'}"
-    if (( mix_index < MIX_START || mix_index > MIX_END )); then
-      continue
-    fi
+  echo "[Step 4/5] Evaluating all variants with OLMES (${EVAL_SCHEDULER_MODE} scheduler)..."
+  echo "[INFO] Eval GPU selection: ${EVAL_GPU_IDS:-all}"
+  echo "[INFO] Eval scheduler will target up to ${TOTAL_VARIANTS} immediate workers."
+  if [ "${EVAL_SCHEDULER_MODE}" = "cluster" ]; then
+    echo "[INFO] Eval host pool: ${EVAL_HOSTS}"
+    echo "[INFO] If the pool exposes >= ${TOTAL_VARIANTS} idle GPUs, all variants start immediately; otherwise the remainder queues."
+  fi
 
-    model_basename="$(basename "${hf_model_dir}")"
-    raw_output_dir="${RAW_RESULTS_DIR}/${model_basename}"
-    echo "[INFO] OLMES eval for ${run_name} -> ${raw_output_dir}"
-    run_single_olmes_eval "${hf_model_dir}" "${raw_output_dir}"
-  done < <(tail -n +2 "${HF_MANIFEST}")
+  PARALLEL_EVAL_CMD=(
+    python scripts/parallel_eval.py
+    --hf-manifest "${HF_MANIFEST}"
+    --raw-results-dir "${RAW_RESULTS_DIR}"
+    --log-dir "${EVAL_DIR}/eval_logs"
+    --state-file "${PARALLEL_EVAL_STATE_FILE}"
+    --batch-size "${OLMES_BATCH_SIZE:-1}"
+    --force-eval "${ROUND1A_FORCE_EVAL:-0}"
+    --mix-start "${MIX_START}"
+    --mix-end "${MIX_END}"
+    --scheduler-mode "${EVAL_SCHEDULER_MODE}"
+    --max-workers "${TOTAL_VARIANTS}"
+    --workdir "${PROJECT_ROOT}"
+    --gpu-ids "${EVAL_GPU_IDS:-all}"
+  )
+
+  if [ "${EVAL_SCHEDULER_MODE}" = "cluster" ]; then
+    PARALLEL_EVAL_CMD+=(
+      --hosts "${EVAL_HOSTS}" \
+      --remote-workdir "${PROJECT_ROOT}"
+    )
+  fi
+
+  PYTHONPATH=src "${PARALLEL_EVAL_CMD[@]}"
 
   echo "[Step 4/5] Aggregating OLMES metrics into CSV..."
   aggregate_olmes_to_csv "${OUTPUT_DIR}" "${MIX_START}" "${MIX_END}"

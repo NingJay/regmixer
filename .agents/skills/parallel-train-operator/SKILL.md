@@ -1,6 +1,6 @@
 ---
 name: parallel-train-operator
-description: Use this skill when running or monitoring regmixer training through scripts/parallel_train.py, especially for cluster scheduling across hpcgpu09-15 and round1a Step 2 execution.
+description: Use this skill when running or monitoring regmixer training and OLMES evaluation through scripts/parallel_train.py and scripts/parallel_eval.py, especially for cluster scheduling across hpcgpu09-15 and round1a execution.
 ---
 
 # Parallel Train Operator
@@ -10,6 +10,7 @@ Use this skill for long-running regmixer training launches and monitoring.
 ## Core rule
 
 Treat `scripts/parallel_train.py` as the single source of truth for training task scheduling. Extend or operate it; do not create a sidecar dispatcher for the same queue.
+Treat `scripts/parallel_eval.py` as the reusable queue worker for round1a OLMES evaluation, with `cluster` mode as the default execution path.
 
 ## Repo split
 
@@ -35,6 +36,8 @@ Treat `scripts/parallel_train.py` as the single source of truth for training tas
 4. Let the scheduler discover idle GPU slots by SSH probe.
 5. Confirm the scheduler has a probe execution timeout in addition to SSH connect timeout.
 6. Confirm the new `parallel_train_state.json` is being updated.
+7. For round1a Step 4, prefer `scripts/parallel_eval.py` with `EVAL_SCHEDULER_MODE=cluster`, `EVAL_HOSTS=hpcgpu09-15`, and `EVAL_GPU_IDS=all`.
+8. Let Step 4 request up to one worker per variant. If the pool exposes fewer idle GPUs than variants, let the remainder queue.
 
 ## Validation ladder
 
@@ -50,7 +53,8 @@ Treat `scripts/parallel_train.py` as the single source of truth for training tas
 1. Read `.agents/docs/hpcgpu-monitoring-loop.md`.
 2. Read `.agents/docs/cluster-runtime-triage.md` when a run fails or appears stuck.
 3. Poll the state file first, then inspect only the logs for mixes that are running or failed.
-4. Report concise progress summaries using mix indices, host, GPU, and status.
+4. For Step 4 eval, inspect `parallel_eval_state.json`, `eval/eval_logs/*.log`, and `eval/raw_olmes/*/metrics.json`.
+5. Report concise progress summaries using mix indices, host, GPU, and status.
 
 ## Failure classification
 

@@ -6,6 +6,7 @@
 - Harness/control-plane repo: `/home/staff/jiayining/vibe_research/regmixer`
 - Preferred runtime repo for real experiments: `/home/staff/jiayining/LLM101-dicksuck-r2/regmixer`
 - Training queue core: `scripts/parallel_train.py`
+- Eval queue core: `scripts/parallel_eval.py`
 - Single-variant executor: `scripts/run_local_variant.py`
 - Round1a entrypoint: `scripts/run_round1a.sh`
 - Shared host pool default: `hpcgpu09,hpcgpu10,hpcgpu11,hpcgpu12,hpcgpu13,hpcgpu14,hpcgpu15`
@@ -15,6 +16,7 @@
 
 - Activate the `regmixer` conda environment before running repo commands locally unless the current shell is already inside an equivalent environment.
 - Reuse `scripts/parallel_train.py` for round1a scheduling. Do not introduce a second dispatcher unless the user explicitly asks for a replacement.
+- Reuse `scripts/parallel_eval.py` for round1a Step 4 OLMES evaluation. Do not fork ad-hoc eval loops when the queue worker fits.
 - Treat `/home/staff/jiayining/vibe_research/regmixer` as the harness/control plane and `/home/staff/jiayining/LLM101-dicksuck-r2/regmixer` as the runtime tree when real experiment files or configs only exist there.
 - The split between control plane and runtime tree is a temporary compatibility measure, not the desired steady state. Prefer converging back to one repo when the harness and runtime paths can safely be unified.
 - Treat a GPU as schedulable only when `nvidia-smi --query-compute-apps` shows no running compute process on that GPU.
@@ -31,9 +33,11 @@
 2. Decide whether the task is harness-only or needs the runtime tree; default real launches to `/home/staff/jiayining/LLM101-dicksuck-r2/regmixer`.
 3. For round1a launches, prefer `ROUND1A_SCHEDULER_MODE=cluster` unless the user asks to stay local.
 4. Let `parallel_train.py` discover idle `(host, gpu)` worker slots and inspect `scan_errors` before calling the run blocked.
-5. Use `.agents/docs/cluster-runtime-triage.md` when a real run fails or appears to hang.
-6. Monitor `parallel_train_state.json`, `outputs/.../logs/*.log`, and `outputs/.../summaries/*.json`.
-7. Only contact the user when a task hits an authorization boundary or a non-trivial failure.
+5. Run Step 4 OLMES through `parallel_eval.py` in `cluster` mode by default so evaluation fans out across idle GPUs on `hpcgpu09-15`.
+6. Let Step 4 target one worker per variant when enough idle GPUs exist; if the pool exposes fewer slots, allow the remainder to queue.
+7. Use `.agents/docs/cluster-runtime-triage.md` when a real run fails or appears to hang.
+8. Monitor `parallel_train_state.json`, `parallel_eval_state.json`, `outputs/.../logs/*.log`, `outputs/.../summaries/*.json`, and `eval/eval_logs/*.log`.
+9. Only contact the user when a task hits an authorization boundary or a non-trivial failure.
 
 ## Natural-Language Launch Contract
 
@@ -42,6 +46,7 @@
   - If the config path points into `/home/staff/jiayining/LLM101-dicksuck-r2/regmixer`, run there.
   - Otherwise start from the current repo and only switch repos if runtime-only files are missing.
 - For training configs, default to `cluster` mode on `hpcgpu09-15` unless the user explicitly asks for local execution.
+- For round1a Step 4 eval, default to `EVAL_SCHEDULER_MODE=cluster`, `EVAL_HOSTS=hpcgpu09-15`, and `EVAL_GPU_IDS=all`.
 - Default validation ladder:
   1. narrow local checks
   2. one real mix smoke on cluster
