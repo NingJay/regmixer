@@ -47,6 +47,7 @@ except ModuleNotFoundError:  # optional dependency for constrained objective pat
 from regmixer.synthesize_mixture import calculate_priors
 from regmixer.eval.constants import WandbMetrics, GroupedWandbMetrics
 from regmixer.eval.law import ScalingLaw
+from regmixer.eval.task_standards import get_mmlu_group_weights
 from regmixer.aliases import SourceConfig, ExperimentConfig
 
 logger = logging.getLogger(__name__)
@@ -1981,82 +1982,8 @@ def aggregate_mmlu(metrics: pd.DataFrame, metrics_to_index: list):
         metrics_to_index.append(output_col)
         return metrics_to_index
 
-    stem_weights = {
-        "mmlu_abstract_algebra:rc::olmes": 0.03313452617627568,
-        "mmlu_astronomy:rc::olmes": 0.05036447978793903,
-        "mmlu_college_biology:rc::olmes": 0.04771371769383698,
-        "mmlu_college_chemistry:rc::olmes": 0.03313452617627568,
-        "mmlu_college_computer_science:rc::olmes": 0.03313452617627568,
-        "mmlu_college_mathematics:rc::olmes": 0.03313452617627568,
-        "mmlu_college_physics:rc::olmes": 0.033797216699801194,
-        "mmlu_computer_security:rc::olmes": 0.03313452617627568,
-        "mmlu_conceptual_physics:rc::olmes": 0.07786613651424784,
-        "mmlu_electrical_engineering:rc::olmes": 0.04804506295559974,
-        "mmlu_elementary_mathematics:rc::olmes": 0.12524850894632206,
-        "mmlu_high_school_biology:rc::olmes": 0.10271703114645461,
-        "mmlu_high_school_chemistry:rc::olmes": 0.06726308813783963,
-        "mmlu_high_school_computer_science:rc::olmes": 0.03313452617627568,
-        "mmlu_high_school_mathematics:rc::olmes": 0.08946322067594434,
-        "mmlu_high_school_physics:rc::olmes": 0.050033134526176276,
-        "mmlu_high_school_statistics:rc::olmes": 0.07157057654075547,
-        "mmlu_machine_learning:rc::olmes": 0.03711066931742876,
-    }
-    other_weights = {
-        "mmlu_anatomy:rc::olmes": 0.04164096236890808,
-        "mmlu_business_ethics:rc::olmes": 0.030845157310302282,
-        "mmlu_clinical_knowledge:rc::olmes": 0.08173966687230105,
-        "mmlu_college_medicine:rc::olmes": 0.05336212214682295,
-        "mmlu_global_facts:rc::olmes": 0.030845157310302282,
-        "mmlu_human_aging:rc::olmes": 0.06878470080197409,
-        "mmlu_management:rc::olmes": 0.03177051202961135,
-        "mmlu_marketing:rc::olmes": 0.07217766810610735,
-        "mmlu_medical_genetics:rc::olmes": 0.030845157310302282,
-        "mmlu_miscellaneous:rc::olmes": 0.24151758173966686,
-        "mmlu_nutrition:rc::olmes": 0.09438618136952498,
-        "mmlu_professional_accounting:rc::olmes": 0.08698334361505243,
-        "mmlu_professional_medicine:rc::olmes": 0.08389882788402221,
-        "mmlu_virology:rc::olmes": 0.05120296113510179,
-    }
-    social_sciences_weights = {
-        "mmlu_econometrics:rc::olmes": 0.03704907377315567,
-        "mmlu_high_school_geography:rc::olmes": 0.06434839129021774,
-        "mmlu_high_school_government_and_politics:rc::olmes": 0.06272343191420214,
-        "mmlu_high_school_macroeconomics:rc::olmes": 0.12674683132921677,
-        "mmlu_high_school_microeconomics:rc::olmes": 0.07734806629834254,
-        "mmlu_high_school_psychology:rc::olmes": 0.17712057198570036,
-        "mmlu_human_sexuality:rc::olmes": 0.04257393565160871,
-        "mmlu_professional_psychology:rc::olmes": 0.19889502762430938,
-        "mmlu_public_relations:rc::olmes": 0.03574910627234319,
-        "mmlu_security_studies:rc::olmes": 0.07962300942476438,
-        "mmlu_sociology:rc::olmes": 0.0653233669158271,
-        "mmlu_us_foreign_policy:rc::olmes": 0.032499187520311994,
-    }
-    humanities_weights = {
-        "mmlu_formal_logic:rc::olmes": 0.026780021253985122,
-        "mmlu_high_school_european_history:rc::olmes": 0.03506907545164718,
-        "mmlu_high_school_us_history:rc::olmes": 0.04335812964930925,
-        "mmlu_high_school_world_history:rc::olmes": 0.050371944739638685,
-        "mmlu_international_law:rc::olmes": 0.0257173219978746,
-        "mmlu_jurisprudence:rc::olmes": 0.022954303931987247,
-        "mmlu_logical_fallacies:rc::olmes": 0.034643995749202974,
-        "mmlu_moral_disputes:rc::olmes": 0.07353878852284804,
-        "mmlu_moral_scenarios:rc::olmes": 0.1902231668437832,
-        "mmlu_philosophy:rc::olmes": 0.06609989373007438,
-        "mmlu_prehistory:rc::olmes": 0.06886291179596174,
-        "mmlu_professional_law:rc::olmes": 0.32603613177470775,
-        "mmlu_world_religions:rc::olmes": 0.03634431455897981,
-    }
-
-    metrics_to_index = add_weighted_dot_column(metrics, stem_weights, "mmlu_stem", metrics_to_index)
-    metrics_to_index = add_weighted_dot_column(
-        metrics, other_weights, "mmlu_other", metrics_to_index
-    )
-    metrics_to_index = add_weighted_dot_column(
-        metrics, social_sciences_weights, "mmlu_social_sciences", metrics_to_index
-    )
-    metrics_to_index = add_weighted_dot_column(
-        metrics, humanities_weights, "mmlu_humanities", metrics_to_index
-    )
+    for output_col, weights in get_mmlu_group_weights(":rc::olmes").items():
+        metrics_to_index = add_weighted_dot_column(metrics, weights, output_col, metrics_to_index)
 
     return metrics, metrics_to_index
 

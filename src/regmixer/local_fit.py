@@ -8,6 +8,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from regmixer.eval.task_standards import ROUND1A_STANDARD_METRICS, build_round1a_standard_metrics
+
 logger = logging.getLogger(__name__)
 
 
@@ -94,6 +96,37 @@ def _shrink_actual_prefix(weights: dict[str, float]) -> Optional[dict[str, float
     return {key.split(":", 1)[1]: value for key, value in weights.items()}
 
 
+def _resolve_metric_frame(
+    df: pd.DataFrame, metric_columns: Optional[str]
+) -> tuple[pd.DataFrame, list[str], str]:
+    if metric_columns:
+        metrics = [metric.strip() for metric in metric_columns.split(",") if metric.strip()]
+        if not metrics:
+            raise RuntimeError("--metric-columns was provided but no metric names were parsed.")
+        missing_metrics = [metric for metric in metrics if metric not in df.columns]
+        if missing_metrics:
+            raise RuntimeError(f"Explicit metric columns were not found in eval CSV: {missing_metrics}")
+        return df.loc[:, metrics].copy(), metrics, "maximize_mean_metric"
+
+    task_columns = [col for col in df.columns if col.startswith("task__")]
+    if not task_columns:
+        raise RuntimeError(
+            "No task__* columns found. Provide --metric-columns or export a standards-compatible eval CSV."
+        )
+
+    task_scores = df.loc[:, task_columns].copy()
+    task_scores.columns = [column.replace("task__", "", 1) for column in task_scores.columns]
+    try:
+        standard_metrics = build_round1a_standard_metrics(task_scores)
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError(
+            "Could not infer a defined optimization objective from eval CSV. "
+            "Provide --metric-columns explicitly or export the full round1a standard task set."
+        ) from exc
+
+    return standard_metrics, list(ROUND1A_STANDARD_METRICS), "maximize_round1a_standard_mean"
+
+
 def run_local_fit(
     *,
     config_path: Path,
@@ -124,18 +157,12 @@ def run_local_fit(
     if not weight_columns:
         raise RuntimeError("No weight columns found or derived for fit-mixture.")
 
-    if metric_columns:
-        metrics = [metric.strip() for metric in metric_columns.split(",") if metric.strip()]
-    else:
-        metrics = [col for col in df.columns if col.startswith("task__")]
-    if not metrics:
-        raise RuntimeError(
-            "No metric columns found. Provide --metric-columns or ensure eval CSV has 'task__*' columns."
-        )
-
     df = df.copy()
     df[weight_columns] = df[weight_columns].apply(pd.to_numeric, errors="coerce")
-    df[metrics] = df[metrics].apply(pd.to_numeric, errors="coerce")
+    metric_frame, metrics, objective_name = _resolve_metric_frame(df, metric_columns)
+    metric_frame = metric_frame.apply(pd.to_numeric, errors="coerce")
+    for column in metric_frame.columns:
+        df[column] = metric_frame[column]
     df = df.dropna(subset=weight_columns + metrics)
     if df.empty:
         raise RuntimeError("No valid rows remain after dropping NaN metrics/weights.")
@@ -174,7 +201,7 @@ def run_local_fit(
 
     result = {
         "method": method,
-        "objective": "maximize_mean_metric",
+        "objective": objective_name,
         "num_runs": int(len(df)),
         "num_domains": int(len(weight_columns)),
         "num_metrics": int(len(metrics)),

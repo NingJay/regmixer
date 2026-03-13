@@ -4,7 +4,7 @@
 # └──────────────────────────────────────────────────────────────────────────┘
 #
 #   这份脚本是 round1a 的唯一入口，负责把 “生成配比 -> 训练 -> 转 HF ->
-#   OLMES 评测 -> 聚合 CSV -> 拟合最优配比” 串成一条完整流水线。
+#   OLMES 评测 -> 聚合 CSV -> 拟合最优配比 -> 生成可视化” 串成一条完整流水线。
 #
 #                               ┌────────────────────┐
 #                               │ 1. 读取实验配置    │
@@ -26,7 +26,7 @@
 # │ 3. 并行训练 15 个 variants                                               │
 # │   调用: scripts/parallel_train.py                                        │
 # │   范围: mix 0..14                                                        │
-# │   资源: 8 张 GPU 固定 worker 队列                                        │
+# │   资源: local/cluster 调度；cluster 下按空闲 GPU 自动起 worker           │
 # │   输出:                                                                  │
 # │     logs/        每个 run 的训练日志                                     │
 # │     summaries/   每个 run 的 summary.json                                │
@@ -72,12 +72,22 @@
 # │   输出: p_star_actual_quality.json                                       │
 # │   结果: 给出 p*_actual_quality，供下一轮实验或正式训练使用               │
 # └──────────────────────────────────────────────────────────────────────────┘
+#                                         │
+#                                         ▼
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ 8. 生成 round1a 标准可视化                                                │
+# │   调用: python scripts/visualize_round1a_results.py                      │
+# │   输入: eval_metrics.csv + p_star_actual_quality.json                    │
+# │   输出: visualizations/*.png + visualizations/*.json                     │
+# │   结果: 生成按 repo 标准聚合后的 simplex / heatmap / 权重对比图          │
+# └──────────────────────────────────────────────────────────────────────────┘
 #
 #   恢复机制:
 #   - ROUND1A_START_STEP=1  从头开始
 #   - ROUND1A_START_STEP=3  从 convert-hf 开始恢复
 #   - ROUND1A_START_STEP=4  只重跑 OLMES + CSV 聚合
 #   - ROUND1A_START_STEP=5  只重跑 fit-mixture
+#   - ROUND1A_START_STEP=6  只重跑可视化
 #
 # ============================================================================
 # Round-1a: actual 内部质量桶比例搜索
@@ -451,6 +461,7 @@ LOG_DIR="${OUTPUT_DIR}/logs"
 SUMMARY_DIR="${OUTPUT_DIR}/summaries"
 EVAL_CSV="${OUTPUT_DIR}/eval_metrics.csv"
 P_STAR_OUTPUT="${OUTPUT_DIR}/p_star_actual_quality.json"
+VISUALIZATION_DIR="${OUTPUT_DIR}/visualizations"
 EVAL_DIR="${OUTPUT_DIR}/eval"
 HF_CACHE_DIR="${EVAL_DIR}/hf_models"
 HF_MANIFEST="${EVAL_DIR}/hf_models_manifest.csv"
@@ -463,8 +474,8 @@ exec > >(tee -a "${PIPELINE_LOG}") 2>&1
 
 # 允许从中间步骤恢复，避免重复跑已经完成的长阶段。
 START_STEP="${ROUND1A_START_STEP:-1}"
-if ! [[ "${START_STEP}" =~ ^[1-5]$ ]]; then
-  echo "[ERROR] ROUND1A_START_STEP must be one of 1,2,3,4,5. Got: ${START_STEP}"
+if ! [[ "${START_STEP}" =~ ^[1-6]$ ]]; then
+  echo "[ERROR] ROUND1A_START_STEP must be one of 1,2,3,4,5,6. Got: ${START_STEP}"
   exit 1
 fi
 
@@ -518,7 +529,7 @@ echo ""
 
 # Step 1: 生成 15 个待搜索的 mix 配置。
 if [ "${START_STEP}" -le 1 ]; then
-  echo "[Step 1/5] Generating mixes..."
+  echo "[Step 1/6] Generating mixes..."
   PYTHONPATH=src python -m regmixer.cli generate-mixes \
     --config "${CONFIG_FILE}" \
     -o "${MIX_FILE}"
@@ -533,13 +544,13 @@ if [ "${START_STEP}" -le 1 ]; then
   echo ""
 else
   require_file "${MIX_FILE}"
-  echo "[Step 1/5] Skipped (reusing mixes): ${MIX_FILE}"
+  echo "[Step 1/6] Skipped (reusing mixes): ${MIX_FILE}"
   echo ""
 fi
 
 # Step 2: 并行训练所有 variant，训练日志写到 logs/，摘要写到 summaries/。
 if [ "${START_STEP}" -le 2 ]; then
-  echo "[Step 2/5] Training ${TOTAL_VARIANTS} variants (${SCHEDULER_MODE} scheduler)..."
+  echo "[Step 2/6] Training ${TOTAL_VARIANTS} variants (${SCHEDULER_MODE} scheduler)..."
   echo "[INFO] Scheduler will try to start up to ${TOTAL_VARIANTS} workers immediately."
   echo "[INFO] If fewer idle GPUs are available, remaining variants will queue automatically."
   echo "⚠️  This will take approximately 26-52 days (depending on throughput)"
@@ -579,13 +590,13 @@ if [ "${START_STEP}" -le 2 ]; then
   echo ""
 else
   require_dir "${SUMMARY_DIR}"
-  echo "[Step 2/5] Skipped (reusing training summaries): ${SUMMARY_DIR}"
+  echo "[Step 2/6] Skipped (reusing training summaries): ${SUMMARY_DIR}"
   echo ""
 fi
 
 # Step 3: 根据 training summary 定位 checkpoint，并统一转换成 HF 目录。
 if [ "${START_STEP}" -le 3 ]; then
-  echo "[Step 3/5] Converting checkpoints to HF model directories..."
+  echo "[Step 3/6] Converting checkpoints to HF model directories..."
   PYTHONPATH=src python -m regmixer.cli convert-hf \
     --config "${CONFIG_FILE}" \
     --log-dir "${LOG_DIR}" \
@@ -598,13 +609,13 @@ if [ "${START_STEP}" -le 3 ]; then
   echo ""
 else
   require_file "${HF_MANIFEST}"
-  echo "[Step 3/5] Skipped (reusing HF manifest): ${HF_MANIFEST}"
+  echo "[Step 3/6] Skipped (reusing HF manifest): ${HF_MANIFEST}"
   echo ""
 fi
 
 # Step 4: 并行 HF checkpoint OLMES 评测，然后把 raw_olmes 聚合成 eval_metrics.csv。
 if [ "${START_STEP}" -le 4 ]; then
-  echo "[Step 4/5] Evaluating all variants with OLMES (${EVAL_SCHEDULER_MODE} scheduler)..."
+  echo "[Step 4/6] Evaluating all variants with OLMES (${EVAL_SCHEDULER_MODE} scheduler)..."
   echo "[INFO] Eval GPU selection: ${EVAL_GPU_IDS:-all}"
   echo "[INFO] Eval scheduler will target up to ${TOTAL_VARIANTS} immediate workers."
   if [ "${EVAL_SCHEDULER_MODE}" = "cluster" ]; then
@@ -637,19 +648,19 @@ if [ "${START_STEP}" -le 4 ]; then
 
   PYTHONPATH=src "${PARALLEL_EVAL_CMD[@]}"
 
-  echo "[Step 4/5] Aggregating OLMES metrics into CSV..."
+  echo "[Step 4/6] Aggregating OLMES metrics into CSV..."
   aggregate_olmes_to_csv "${OUTPUT_DIR}" "${MIX_START}" "${MIX_END}"
   echo "✓ Evaluation completed: ${EVAL_CSV}"
   echo ""
 else
   require_file "${EVAL_CSV}"
-  echo "[Step 4/5] Skipped (reusing eval CSV): ${EVAL_CSV}"
+  echo "[Step 4/6] Skipped (reusing eval CSV): ${EVAL_CSV}"
   echo ""
 fi
 
 # Step 5: 用聚合后的 eval CSV 拟合最优 mixture，输出 p*。
 if [ "${START_STEP}" -le 5 ]; then
-  echo "[Step 5/5] Fitting regression model..."
+  echo "[Step 5/6] Fitting regression model..."
   PYTHONPATH=src python -m regmixer.cli fit-mixture \
     --config "${CONFIG_FILE}" \
     --eval-metrics "${EVAL_CSV}" \
@@ -657,7 +668,23 @@ if [ "${START_STEP}" -le 5 ]; then
 
   echo "✓ Regression completed: ${P_STAR_OUTPUT}"
   echo ""
+else
+  require_file "${P_STAR_OUTPUT}"
+  echo "[Step 5/6] Skipped (reusing fit output): ${P_STAR_OUTPUT}"
+  echo ""
 fi
+
+# Step 6: 基于标准评测口径生成可视化。
+echo "[Step 6/6] Generating visualizations..."
+require_file "${EVAL_CSV}"
+require_file "${P_STAR_OUTPUT}"
+PYTHONPATH=src python scripts/visualize_round1a_results.py \
+  --eval-metrics "${EVAL_CSV}" \
+  --fit-json "${P_STAR_OUTPUT}" \
+  --output-dir "${VISUALIZATION_DIR}"
+
+echo "✓ Visualizations completed: ${VISUALIZATION_DIR}"
+echo ""
 
 # Display results
 echo "============================================================================"
@@ -668,6 +695,7 @@ cat "${P_STAR_OUTPUT}"
 echo ""
 echo "Next steps:"
 echo "  1. Review ${P_STAR_OUTPUT}"
-echo "  2. Copy weights to nemotron-cc-round1b-kind2.yaml (actual topics)"
-echo "  3. Run Round-1b: scripts/run_round1b.sh"
+echo "  2. Review visualizations under ${VISUALIZATION_DIR}"
+echo "  3. Copy weights to nemotron-cc-round1b-kind2.yaml (actual topics)"
+echo "  4. Run Round-1b: scripts/run_round1b.sh"
 echo "============================================================================"
