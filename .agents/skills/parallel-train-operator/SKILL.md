@@ -15,6 +15,15 @@ Treat `scripts/parallel_train.py` as the single source of truth for training tas
 
 - Use `/home/staff/jiayining/vibe_research/regmixer` as the harness/control plane.
 - Use `/home/staff/jiayining/LLM101-dicksuck-r2/regmixer` as the runtime tree for real experiments when files or configs differ between trees.
+- Treat this split as temporary compatibility, not a required long-term architecture.
+
+## Natural-language trigger
+
+- If the user says `帮我跑这个实验：<config路径>` or similar, interpret that as permission to execute the experiment end-to-end.
+- Infer the repo from the config path.
+- Default to cluster execution for training workloads.
+- Do the 1-mix smoke first, then scale out if healthy.
+- Only ask follow-up questions when the target is genuinely ambiguous or an approval boundary is reached.
 
 ## Launch workflow
 

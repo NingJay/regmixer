@@ -16,6 +16,7 @@
 - Activate the `regmixer` conda environment before running repo commands locally unless the current shell is already inside an equivalent environment.
 - Reuse `scripts/parallel_train.py` for round1a scheduling. Do not introduce a second dispatcher unless the user explicitly asks for a replacement.
 - Treat `/home/staff/jiayining/vibe_research/regmixer` as the harness/control plane and `/home/staff/jiayining/LLM101-dicksuck-r2/regmixer` as the runtime tree when real experiment files or configs only exist there.
+- The split between control plane and runtime tree is a temporary compatibility measure, not the desired steady state. Prefer converging back to one repo when the harness and runtime paths can safely be unified.
 - Treat a GPU as schedulable only when `nvidia-smi --query-compute-apps` shows no running compute process on that GPU.
 - Cluster probing must use both SSH connect timeout and probe execution timeout. A host-level probe timeout should become `scan_errors`, not a global scheduler hang.
 - Assume cluster paths are shared across `hpcgpu09-15`; verify before changing that assumption.
@@ -33,6 +34,19 @@
 5. Use `.agents/docs/cluster-runtime-triage.md` when a real run fails or appears to hang.
 6. Monitor `parallel_train_state.json`, `outputs/.../logs/*.log`, and `outputs/.../summaries/*.json`.
 7. Only contact the user when a task hits an authorization boundary or a non-trivial failure.
+
+## Natural-Language Launch Contract
+
+- If the user says `帮我跑这个实验：<config路径>` or equivalent, treat it as an execution request, not a planning request.
+- Infer the execution repo from the config path first.
+  - If the config path points into `/home/staff/jiayining/LLM101-dicksuck-r2/regmixer`, run there.
+  - Otherwise start from the current repo and only switch repos if runtime-only files are missing.
+- For training configs, default to `cluster` mode on `hpcgpu09-15` unless the user explicitly asks for local execution.
+- Default validation ladder:
+  1. narrow local checks
+  2. one real mix smoke on cluster
+  3. full run only after the smoke is healthy
+- Do not require the user to provide scheduler mode, host pool, GPU ids, or monitoring instructions unless the task is genuinely ambiguous.
 
 ## Ask first
 

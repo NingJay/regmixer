@@ -28,6 +28,7 @@ Run `scripts/run_round1a.sh` with agent-operated scheduling so the heavy Step 2 
 
 - The correct validation ladder is: focused local checks, 1-mix real cluster smoke, then 8-GPU real smoke.
 - Distinguish harness health from runtime health. A tiny custom CUDA smoke can prove the scheduler is healthy even when regmixer runtime is broken.
+- The user-facing API should stay minimal. `帮我跑这个实验：<config路径>` should be enough for the agent to infer repo, scheduler mode, smoke-first execution, and monitoring behavior.
 - Current `olmo_core` compatibility required shims for:
   - `NumpyDatasetType` vs `NumpyFSLDatasetConfig`
   - old vs new `SourceMixtureDatasetConfig` constructor shape
