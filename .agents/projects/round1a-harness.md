@@ -2,45 +2,58 @@
 
 ## Goal
 
-Run `scripts/run_round1a.sh` with agent-operated scheduling so Step 2 training and Step 4 evaluation can both consume idle GPUs across `hpcgpu09-15` without inventing ad-hoc dispatchers.
+Run `scripts/run_round1a.sh` with an agent-operated launch loop so Step 2 training and Step 4 evaluation can both consume idle GPUs across `hpcgpu09-15`, while keeping SSH probing and slot policy outside the executors.
 
 ## Current shape
 
-- `scripts/parallel_train.py` is the queue scheduler.
-- `scripts/parallel_eval.py` is the OLMES eval queue and now supports local or cluster scheduling.
-- `scripts/run_local_variant.py` is the single GPU execution unit.
+- `scripts/control_plane.py` owns launch-loop behavior:
+  - probe host pool
+  - detect idle GPU slots
+  - write unified `control_plane_state.json`
+  - emit per-phase slot plans
+  - launch the relevant executor
+- `scripts/parallel_train.py` is the train executor queue.
+- `scripts/parallel_eval.py` is the OLMES eval executor queue.
+- `scripts/run_local_variant.py` is the single-GPU execution unit.
 - `/home/staff/jiayining/vibe_research/regmixer` is the harness/control-plane tree.
 - `/home/staff/jiayining/LLM101-dicksuck-r2/regmixer` is the preferred runtime tree for real launches.
-- `scripts/run_round1a.sh` now exposes:
-  - `ROUND1A_SCHEDULER_MODE=local|cluster`
-  - `ROUND1A_GPU_IDS`
-  - `ROUND1A_HOSTS`
-- Cluster mode writes `parallel_train_state.json` next to the run outputs.
+- `scripts/run_round1a.sh` now routes Step 2 and Step 4 through the control plane.
+
+## State model
+
+- Unified control state: `control_plane_state.json`
+- Train executor state: `parallel_train_state.json`
+- Eval executor state: `parallel_eval_state.json`
+- Train slot plan: `train_slot_plan.json`
+- Eval slot plan: `eval_slot_plan.json`
+
+The control-plane file is the repo-level launch memory. Executor files remain the detailed task ledger.
 
 ## Operator notes
 
 - Local operator sessions should begin with `source ~/.bashrc && conda activate regmixer`.
 - Shared paths are assumed to exist on every host in the pool.
 - Remote execution activates conda env `regmixer` after sourcing `~/.bashrc`.
-- Scheduler probe failures should be recorded as `scan_errors`; they should not hang the whole run.
-- Round1a still runs stages 1 through 5 in order; Step 2 training and Step 4 evaluation now both have queue-based scheduling.
+- Scheduler probe failures should be recorded as `scan_errors`; they should not hang the whole phase.
+- Round1a still runs stages 1 through 6 in order; Step 2 training and Step 4 evaluation now both have a control-plane launch step followed by executor queueing.
 - Step 4 defaults to `cluster` mode, targets one worker per variant, and only falls back to queueing when the pool exposes fewer than 15 idle GPUs.
 
-## Learnings from the March 13 update
+## Learnings from the March 15 control-plane split
 
-- The correct validation ladder is: focused local checks, 1-mix real cluster smoke, then 8-GPU real smoke.
-- Eval throughput matters too, but local-only 8-GPU queues are not enough for round1a. Step 4 has to scan the shared host pool and start all 15 variants immediately when at least 15 idle GPUs exist.
-- Distinguish harness health from runtime health. A tiny custom CUDA smoke can prove the scheduler is healthy even when regmixer runtime is broken.
-- The user-facing API should stay minimal. `帮我跑这个实验：<config路径>` should be enough for the agent to infer repo, scheduler mode, smoke-first execution, and monitoring behavior.
-- Current `olmo_core` compatibility required shims for:
-  - `NumpyDatasetType` vs `NumpyFSLDatasetConfig`
-  - old vs new `SourceMixtureDatasetConfig` constructor shape
-  - short-run scheduler decay on 1-step smoke runs
-- Real validation succeeded with:
-  - 1-mix smoke run `integration-regmixer-smoke-1gpu-20260312-215437`
-  - 8-mix / 8-GPU smoke run `integration-regmixer-smoke-8gpu-20260312-215748`
+- The earlier abstraction was wrong because SSH probing, slot discovery, and executor queueing were mixed together in `parallel_train.py` and `parallel_eval.py`.
+- The cleaner boundary is:
+  - control plane owns cluster-facing decisions and unified state
+  - executors own task fan-out across already assigned slots
+- The correct validation ladder is now:
+  1. focused local checks
+  2. local control-plane integration tests
+  3. 1-mix real cluster smoke
+  4. wider cluster occupancy only after the 1-mix run is healthy
+- Agent markdown now acts as control-plane surface area, not just notes. It documents the launch loop, monitoring cadence, escalation boundaries, and repo memory.
+- User-facing API should stay minimal. `帮我跑这个实验：<config路径>` should be enough for the agent to infer repo, scheduler mode, smoke-first execution, and monitoring behavior.
 
 ## Follow-ups
 
-- Add a resumable monitor command if agent-side polling from markdown becomes insufficient.
-- Decide whether Step 3 to Step 5 should remain synchronous or move into their own long-running control loops.
+- Add a persistent monitor command if markdown-driven polling becomes insufficient.
+- Decide whether Step 3 to Step 6 should remain synchronous or move into their own long-running control loops.
+- Consider moving repo selection and config-path normalization into a reusable Python contract module if agent surface area keeps growing.

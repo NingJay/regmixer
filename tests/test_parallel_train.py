@@ -3,8 +3,6 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 
 def load_parallel_train_module():
     module_path = Path(__file__).resolve().parents[1] / "scripts" / "parallel_train.py"
@@ -17,93 +15,6 @@ def load_parallel_train_module():
 
 
 parallel_train = load_parallel_train_module()
-
-
-def test_parse_nvidia_smi_gpu_output_parses_rows():
-    stdout = "\n".join(
-        [
-            "0, GPU-aaa, 0, 0",
-            "1, GPU-bbb, 2048, 31",
-        ]
-    )
-
-    snapshots = parallel_train.parse_nvidia_smi_gpu_output(stdout)
-
-    assert [snapshot.gpu_id for snapshot in snapshots] == [0, 1]
-    assert snapshots[1].gpu_uuid == "GPU-bbb"
-    assert snapshots[1].memory_used_mb == 2048
-    assert snapshots[1].utilization_gpu == 31
-
-
-def test_parse_nvidia_smi_compute_output_ignores_empty_state():
-    stdout = "No running processes found"
-
-    busy = parallel_train.parse_nvidia_smi_compute_output(stdout)
-
-    assert busy == set()
-
-
-def test_parse_gpu_ids_accepts_all():
-    assert parallel_train.parse_gpu_ids("all") is None
-
-
-def test_resolve_worker_limit_defaults_to_mix_count():
-    assert parallel_train.resolve_worker_limit(None, [0, 1, 2, 3]) == 4
-    assert parallel_train.resolve_worker_limit(2, [0, 1, 2, 3]) == 2
-
-
-def test_select_idle_slots_filters_busy_and_disallowed_gpu_ids():
-    snapshots = [
-        parallel_train.GpuSnapshot(gpu_id=0, gpu_uuid="GPU-0", memory_used_mb=0, utilization_gpu=0),
-        parallel_train.GpuSnapshot(gpu_id=1, gpu_uuid="GPU-1", memory_used_mb=0, utilization_gpu=0),
-        parallel_train.GpuSnapshot(gpu_id=2, gpu_uuid="GPU-2", memory_used_mb=0, utilization_gpu=0),
-    ]
-
-    slots, busy_gpu_ids = parallel_train.select_idle_slots(
-        host="hpcgpu11",
-        gpu_snapshots=snapshots,
-        busy_gpu_uuids={"GPU-1"},
-        allowed_gpu_ids=[0, 1],
-    )
-
-    assert [slot.label for slot in slots] == ["hpcgpu11:0"]
-    assert busy_gpu_ids == [1]
-
-
-def test_select_idle_slots_uses_all_gpus_when_allowed_ids_are_omitted():
-    snapshots = [
-        parallel_train.GpuSnapshot(gpu_id=0, gpu_uuid="GPU-0", memory_used_mb=0, utilization_gpu=0),
-        parallel_train.GpuSnapshot(gpu_id=1, gpu_uuid="GPU-1", memory_used_mb=0, utilization_gpu=0),
-    ]
-
-    slots, busy_gpu_ids = parallel_train.select_idle_slots(
-        host="hpcgpu11",
-        gpu_snapshots=snapshots,
-        busy_gpu_uuids=set(),
-        allowed_gpu_ids=None,
-    )
-
-    assert [slot.label for slot in slots] == ["hpcgpu11:0", "hpcgpu11:1"]
-    assert busy_gpu_ids == []
-
-
-def test_build_worker_slots_discovers_local_gpus_when_gpu_ids_are_omitted(monkeypatch):
-    def fake_discover_local_gpu_ids():
-        return [0, 1, 2]
-
-    monkeypatch.setattr(parallel_train, "discover_local_gpu_ids", fake_discover_local_gpu_ids)
-
-    slots, scan_errors = parallel_train.build_worker_slots(
-        scheduler_mode="local",
-        hosts=[],
-        gpu_ids=None,
-        connect_timeout=5,
-        probe_timeout=5,
-        max_workers=2,
-    )
-
-    assert [slot.gpu_id for slot in slots] == [0, 1]
-    assert scan_errors == {}
 
 
 def test_build_remote_task_command_contains_expected_remote_bootstrap(tmp_path):
@@ -142,16 +53,6 @@ def test_build_remote_task_command_contains_expected_remote_bootstrap(tmp_path):
     assert str(workdir / "scripts" / "run_local_variant.py") in task_cmd
 
 
-def test_run_remote_capture_times_out_probe(monkeypatch):
-    def fake_run(*args, **kwargs):
-        raise parallel_train.subprocess.TimeoutExpired(cmd="ssh hpcgpu12 ...", timeout=9)
-
-    monkeypatch.setattr(parallel_train.subprocess, "run", fake_run)
-
-    with pytest.raises(RuntimeError, match=r"ssh probe timed out for hpcgpu12 after 9s"):
-        parallel_train.run_remote_capture("hpcgpu12", "nvidia-smi", connect_timeout=5, probe_timeout=9)
-
-
 def test_state_file_tracks_started_and_completed_tasks(tmp_path):
     state_path = tmp_path / "parallel_train_state.json"
     cfg = parallel_train.WorkerConfig(
@@ -169,7 +70,7 @@ def test_state_file_tracks_started_and_completed_tasks(tmp_path):
         remote_workdir=str(tmp_path),
     )
     slot = parallel_train.WorkerSlot(host="hpcgpu09", gpu_id=0, gpu_uuid="GPU-0")
-    state = parallel_train.initialize_state(cfg, [slot], [0], {})
+    state = parallel_train.initialize_state(cfg, [slot], [0], {}, str(tmp_path / "train_slot_plan.json"))
 
     parallel_train.apply_event_to_state(
         state,
@@ -206,6 +107,7 @@ def test_state_file_tracks_started_and_completed_tasks(tmp_path):
 
     payload = json.loads(state_path.read_text(encoding="utf-8"))
 
+    assert payload["slot_plan_file"].endswith("train_slot_plan.json")
     assert payload["tasks"]["0"]["status"] == "succeeded"
     assert payload["tasks"]["0"]["host"] == "hpcgpu09"
     assert payload["tasks"]["0"]["return_code"] == 0

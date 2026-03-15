@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Parallel regmixer variant scheduler for local and shared-cluster execution."""
+"""Parallel regmixer train executor driven by an external control plane."""
 
 from __future__ import annotations
 
@@ -8,32 +8,25 @@ import json
 import multiprocessing as mp
 import os
 import shlex
-import socket
 import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-DEFAULT_CLUSTER_HOSTS = "hpcgpu09,hpcgpu10,hpcgpu11,hpcgpu12,hpcgpu13,hpcgpu14,hpcgpu15"
-DEFAULT_REMOTE_CONDA_ENV = "regmixer"
-DEFAULT_REMOTE_SHELL_INIT = "~/.bashrc"
+from regmixer.controlplane import (
+    DEFAULT_REMOTE_CONDA_ENV,
+    DEFAULT_REMOTE_SHELL_INIT,
+    WorkerSlot,
+    build_remote_bash_command,
+    build_ssh_command,
+    read_slot_plan_file,
+    resolve_path,
+    validate_cluster_mode_paths,
+)
+
 DEFAULT_PASSTHROUGH_ENV = "WANDB_MODE,REGMIXER_DISABLE_SWANLAB_SYNC"
-DEFAULT_SSH_PROBE_TIMEOUT = 15
-
-
-@dataclass(frozen=True)
-class WorkerSlot:
-    host: str
-    gpu_id: int
-    gpu_uuid: Optional[str] = None
-    memory_used_mb: Optional[int] = None
-    utilization_gpu: Optional[int] = None
-
-    @property
-    def label(self) -> str:
-        return f"{self.host}:{self.gpu_id}"
 
 
 @dataclass(frozen=True)
@@ -67,18 +60,8 @@ class TaskSpec:
     summary_path: str
 
 
-@dataclass(frozen=True)
-class GpuSnapshot:
-    gpu_id: int
-    gpu_uuid: str
-    memory_used_mb: int
-    utilization_gpu: int
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run regmixer mixes with a local or shared-cluster worker queue."
-    )
+    parser = argparse.ArgumentParser(description="Run regmixer mixes over an explicit slot plan.")
     parser.add_argument("--config", required=True, help="Path to regmixer YAML config.")
     parser.add_argument("--mix-file", required=True, help="Path to generated mixes JSON.")
     parser.add_argument("--group-id", required=True, help="Group id passed to run_local_variant.py.")
@@ -87,45 +70,20 @@ def parse_args() -> argparse.Namespace:
         default="parquet-e2e-fit-train",
         help="Run name prefix. Full name is '<prefix>-<mix_index:04d>'.",
     )
-    parser.add_argument(
-        "--mix-start",
-        type=int,
-        default=0,
-        help="First mix index (inclusive).",
-    )
-    parser.add_argument(
-        "--mix-end",
-        type=int,
-        default=11,
-        help="Last mix index (inclusive).",
-    )
+    parser.add_argument("--mix-start", type=int, default=0, help="First mix index (inclusive).")
+    parser.add_argument("--mix-end", type=int, default=11, help="Last mix index (inclusive).")
     parser.add_argument(
         "--scheduler-mode",
         choices=("local", "cluster"),
-        default="local",
-        help="Use local GPUs directly or discover free GPUs across a shared SSH host pool.",
+        required=True,
+        help="Execution mode for the assigned slots.",
     )
     parser.add_argument(
-        "--gpu-ids",
-        default="0,1,2,3,4,5,6,7",
-        help="Comma-separated GPU ids allowed per worker host.",
+        "--slots-file",
+        required=True,
+        help="JSON slot plan emitted by scripts/control_plane.py.",
     )
-    parser.add_argument(
-        "--hosts",
-        default=DEFAULT_CLUSTER_HOSTS,
-        help="Comma-separated SSH hosts scanned in cluster mode.",
-    )
-    parser.add_argument(
-        "--max-workers",
-        type=int,
-        default=None,
-        help="Optional cap on discovered worker slots after scanning.",
-    )
-    parser.add_argument(
-        "--workdir",
-        default=".",
-        help="Working directory for subprocess execution.",
-    )
+    parser.add_argument("--workdir", default=".", help="Working directory for subprocess execution.")
     parser.add_argument(
         "--remote-workdir",
         default=None,
@@ -141,16 +99,8 @@ def parse_args() -> argparse.Namespace:
         default="scripts/run_local_variant.py",
         help="Path to run_local_variant.py relative to workdir or absolute.",
     )
-    parser.add_argument(
-        "--pythonpath",
-        default="src",
-        help="PYTHONPATH injected to each task subprocess.",
-    )
-    parser.add_argument(
-        "--log-dir",
-        default="outputs/dryfit_fit/logs",
-        help="Directory for per-task logs.",
-    )
+    parser.add_argument("--pythonpath", default="src", help="PYTHONPATH injected to each task subprocess.")
+    parser.add_argument("--log-dir", default="outputs/dryfit_fit/logs", help="Directory for per-task logs.")
     parser.add_argument(
         "--summary-dir",
         default="outputs/dryfit_fit/summaries",
@@ -159,7 +109,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--state-file",
         default=None,
-        help="Path to incremental scheduler state JSON. Defaults to <summary-dir>/../parallel_train_state.json.",
+        help="Path to incremental executor state JSON. Defaults to <summary-dir>/../parallel_train_state.json.",
     )
     parser.add_argument(
         "--output-root-dir",
@@ -194,40 +144,11 @@ def parse_args() -> argparse.Namespace:
         help="Per-host SSH connect timeout in seconds.",
     )
     parser.add_argument(
-        "--ssh-probe-timeout",
-        type=int,
-        default=DEFAULT_SSH_PROBE_TIMEOUT,
-        help="Execution timeout in seconds for remote probe commands such as nvidia-smi.",
-    )
-    parser.add_argument(
         "--passthrough-env",
         default=DEFAULT_PASSTHROUGH_ENV,
         help="Comma-separated env vars copied into remote task commands when present locally.",
     )
     return parser.parse_args()
-
-
-def parse_csv_list(raw: str) -> List[str]:
-    items = [part.strip() for part in raw.split(",") if part.strip()]
-    if not items:
-        raise ValueError("comma-separated value list is empty")
-    return items
-
-
-def parse_gpu_ids(raw: str) -> Optional[List[int]]:
-    if raw.strip().lower() == "all":
-        return None
-    gpu_ids = [int(item) for item in parse_csv_list(raw)]
-    if len(set(gpu_ids)) != len(gpu_ids):
-        raise ValueError(f"gpu id list contains duplicates: {gpu_ids}")
-    return gpu_ids
-
-
-def parse_hosts(raw: str) -> List[str]:
-    hosts = parse_csv_list(raw)
-    if len(set(hosts)) != len(hosts):
-        raise ValueError(f"host list contains duplicates: {hosts}")
-    return hosts
 
 
 def build_mix_indices(start: int, end: int) -> List[int]:
@@ -238,12 +159,6 @@ def build_mix_indices(start: int, end: int) -> List[int]:
     return list(range(start, end + 1))
 
 
-def resolve_worker_limit(requested_max_workers: Optional[int], mix_indices: Sequence[int]) -> int:
-    if requested_max_workers is not None:
-        return requested_max_workers
-    return len(mix_indices)
-
-
 def resolve_python_bin(scheduler_mode: str, python_bin: Optional[str]) -> str:
     if python_bin:
         return python_bin
@@ -252,156 +167,8 @@ def resolve_python_bin(scheduler_mode: str, python_bin: Optional[str]) -> str:
     return sys.executable
 
 
-def resolve_path(value: str, base_dir: str) -> str:
-    path = Path(value)
-    if path.is_absolute():
-        return str(path)
-    return str((Path(base_dir) / path).resolve())
-
-
 def default_state_file(summary_dir: str) -> str:
     return str(Path(summary_dir).parent / "parallel_train_state.json")
-
-
-def parse_nvidia_smi_gpu_output(stdout: str) -> List[GpuSnapshot]:
-    snapshots: List[GpuSnapshot] = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line or line.lower().startswith("index"):
-            continue
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) != 4:
-            raise ValueError(f"unexpected GPU row: {line}")
-        snapshots.append(
-            GpuSnapshot(
-                gpu_id=int(parts[0]),
-                gpu_uuid=parts[1],
-                memory_used_mb=int(parts[2]),
-                utilization_gpu=int(parts[3]),
-            )
-        )
-    return snapshots
-
-
-def discover_local_gpu_ids() -> List[int]:
-    proc = subprocess.run(
-        [
-            "nvidia-smi",
-            "--query-gpu=index,uuid,memory.used,utilization.gpu",
-            "--format=csv,noheader,nounits",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        stderr = (proc.stderr or proc.stdout).strip()
-        raise RuntimeError(f"local gpu probe failed: {stderr or f'rc={proc.returncode}'}")
-    return [snapshot.gpu_id for snapshot in parse_nvidia_smi_gpu_output(proc.stdout)]
-
-
-def parse_nvidia_smi_compute_output(stdout: str) -> Set[str]:
-    gpu_uuids: Set[str] = set()
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line or line.lower().startswith("gpu_uuid"):
-            continue
-        if "No running processes found" in line:
-            continue
-        parts = [part.strip() for part in line.split(",", 2)]
-        if not parts or not parts[0]:
-            continue
-        gpu_uuids.add(parts[0])
-    return gpu_uuids
-
-
-def select_idle_slots(
-    host: str,
-    gpu_snapshots: Sequence[GpuSnapshot],
-    busy_gpu_uuids: Set[str],
-    allowed_gpu_ids: Optional[Iterable[int]],
-) -> Tuple[List[WorkerSlot], List[int]]:
-    allowed = set(allowed_gpu_ids) if allowed_gpu_ids is not None else None
-    idle_slots: List[WorkerSlot] = []
-    busy_gpu_ids: List[int] = []
-    for snapshot in gpu_snapshots:
-        if allowed is not None and snapshot.gpu_id not in allowed:
-            continue
-        if snapshot.gpu_uuid in busy_gpu_uuids:
-            busy_gpu_ids.append(snapshot.gpu_id)
-            continue
-        idle_slots.append(
-            WorkerSlot(
-                host=host,
-                gpu_id=snapshot.gpu_id,
-                gpu_uuid=snapshot.gpu_uuid,
-                memory_used_mb=snapshot.memory_used_mb,
-                utilization_gpu=snapshot.utilization_gpu,
-            )
-        )
-    return idle_slots, busy_gpu_ids
-
-
-def build_ssh_command(host: str, remote_command: str, connect_timeout: int) -> List[str]:
-    return [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        f"ConnectTimeout={connect_timeout}",
-        host,
-        remote_command,
-    ]
-
-
-def build_remote_bash_command(body: str) -> str:
-    return f"bash -lc {shlex.quote(body)}"
-
-
-def run_remote_capture(host: str, body: str, connect_timeout: int, probe_timeout: int) -> str:
-    try:
-        proc = subprocess.run(
-            build_ssh_command(host, build_remote_bash_command(body), connect_timeout),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=probe_timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"ssh probe timed out for {host} after {probe_timeout}s") from exc
-    if proc.returncode != 0:
-        stderr = (proc.stderr or proc.stdout).strip()
-        raise RuntimeError(f"ssh probe failed for {host}: {stderr or f'rc={proc.returncode}'}")
-    return proc.stdout
-
-
-def discover_cluster_slots(
-    hosts: Sequence[str],
-    allowed_gpu_ids: Optional[Sequence[int]],
-    connect_timeout: int,
-    probe_timeout: int,
-) -> Tuple[List[WorkerSlot], Dict[str, str]]:
-    slots: List[WorkerSlot] = []
-    scan_errors: Dict[str, str] = {}
-    gpu_query = "nvidia-smi --query-gpu=index,uuid,memory.used,utilization.gpu --format=csv,noheader,nounits"
-    compute_query = "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name --format=csv,noheader 2>/dev/null || true"
-
-    for host in hosts:
-        try:
-            gpu_stdout = run_remote_capture(host, gpu_query, connect_timeout, probe_timeout)
-            compute_stdout = run_remote_capture(host, compute_query, connect_timeout, probe_timeout)
-            gpu_snapshots = parse_nvidia_smi_gpu_output(gpu_stdout)
-            busy_gpu_uuids = parse_nvidia_smi_compute_output(compute_stdout)
-            host_slots, busy_gpu_ids = select_idle_slots(host, gpu_snapshots, busy_gpu_uuids, allowed_gpu_ids)
-            busy_desc = ",".join(str(gpu_id) for gpu_id in sorted(busy_gpu_ids)) or "-"
-            idle_desc = ",".join(str(slot.gpu_id) for slot in host_slots) or "-"
-            print(f"[scan] host={host} idle_gpus={idle_desc} busy_gpus={busy_desc}")
-            slots.extend(host_slots)
-        except Exception as exc:
-            scan_errors[host] = str(exc)
-            print(f"[scan][ERROR] host={host} {exc}", file=sys.stderr)
-
-    return slots, scan_errors
 
 
 def build_command(cfg: WorkerConfig, mix_index: int, run_name: str, summary_out: str) -> List[str]:
@@ -465,12 +232,7 @@ def build_task_spec(cfg: WorkerConfig, mix_index: int) -> TaskSpec:
     run_name = f"{cfg.run_name_prefix}-{idx}"
     log_path = str(Path(cfg.log_dir) / f"{run_name}.log")
     summary_path = str(Path(cfg.summary_dir) / f"{run_name}.json")
-    return TaskSpec(
-        mix_index=mix_index,
-        run_name=run_name,
-        log_path=log_path,
-        summary_path=summary_path,
-    )
+    return TaskSpec(mix_index=mix_index, run_name=run_name, log_path=log_path, summary_path=summary_path)
 
 
 def build_started_event(slot: WorkerSlot, task: TaskSpec) -> Dict[str, Any]:
@@ -517,19 +279,20 @@ def run_single_task(slot: WorkerSlot, task: TaskSpec, cfg: WorkerConfig) -> Dict
     try:
         with log_path.open("w", encoding="utf-8") as logf:
             logf.write(
-                f"[scheduler] mode={cfg.scheduler_mode} host={slot.host} gpu_id={slot.gpu_id} mix_index={task.mix_index}\n"
+                f"[train_executor] mode={cfg.scheduler_mode} host={slot.host} gpu_id={slot.gpu_id} "
+                f"mix_index={task.mix_index}\n"
             )
             if slot.gpu_uuid:
-                logf.write(f"[scheduler] gpu_uuid={slot.gpu_uuid}\n")
-            logf.write(f"[scheduler] task_command={task_cmd}\n")
+                logf.write(f"[train_executor] gpu_uuid={slot.gpu_uuid}\n")
+            logf.write(f"[train_executor] task_command={task_cmd}\n")
             logf.write(
-                "[scheduler] env "
+                "[train_executor] env "
                 f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} "
                 f"MASTER_PORT={env['MASTER_PORT']} "
                 f"TORCH_DISTRIBUTED_DEFAULT_PORT={env['TORCH_DISTRIBUTED_DEFAULT_PORT']}\n"
             )
             if cfg.scheduler_mode == "cluster":
-                logf.write(f"[scheduler] ssh_command={shlex.join(exec_cmd)}\n")
+                logf.write(f"[train_executor] ssh_command={shlex.join(exec_cmd)}\n")
             logf.flush()
             proc = subprocess.run(
                 exec_cmd,
@@ -544,7 +307,7 @@ def run_single_task(slot: WorkerSlot, task: TaskSpec, cfg: WorkerConfig) -> Dict
         error_message = f"{type(exc).__name__}: {exc}"
         try:
             with log_path.open("a", encoding="utf-8") as logf:
-                logf.write(f"[scheduler] exception={error_message}\n")
+                logf.write(f"[train_executor] exception={error_message}\n")
         except OSError:
             pass
 
@@ -593,14 +356,17 @@ def initialize_state(
     slots: Sequence[WorkerSlot],
     mix_indices: Sequence[int],
     scan_errors: Dict[str, str],
+    slots_file: str,
 ) -> Dict[str, Any]:
     return {
+        "executor": "parallel_train.py",
         "scheduler_mode": cfg.scheduler_mode,
         "workdir": cfg.workdir,
         "config_path": cfg.config_path,
         "mix_file": cfg.mix_file,
         "group_id": cfg.group_id,
         "mix_indices": list(mix_indices),
+        "slot_plan_file": slots_file,
         "scan_errors": scan_errors,
         "slots": [asdict(slot) for slot in slots],
         "tasks": {},
@@ -656,46 +422,9 @@ def write_state_file(path: str, state: Dict[str, Any]) -> None:
     tmp_path.replace(state_path)
 
 
-def build_worker_slots(
-    scheduler_mode: str,
-    hosts: Sequence[str],
-    gpu_ids: Optional[Sequence[int]],
-    connect_timeout: int,
-    probe_timeout: int,
-    max_workers: Optional[int],
-) -> Tuple[List[WorkerSlot], Dict[str, str]]:
-    if scheduler_mode == "cluster":
-        slots, scan_errors = discover_cluster_slots(hosts, gpu_ids, connect_timeout, probe_timeout)
-        if max_workers is not None:
-            slots = slots[:max_workers]
-        if not slots:
-            error_text = "; ".join(f"{host}: {msg}" for host, msg in scan_errors.items()) or "no idle GPU slots found"
-            raise RuntimeError(f"cluster mode found no schedulable slots ({error_text})")
-        return slots, scan_errors
-
-    local_host = socket.gethostname()
-    if gpu_ids is None:
-        gpu_ids = discover_local_gpu_ids()
-    slots = [WorkerSlot(host=local_host, gpu_id=gpu_id) for gpu_id in gpu_ids]
-    if max_workers is not None:
-        slots = slots[:max_workers]
-    return slots, {}
-
-
-def validate_cluster_mode_paths(workdir: str, remote_workdir: Optional[str]) -> None:
-    if not Path(workdir).is_absolute():
-        raise ValueError("cluster mode requires an absolute --workdir")
-    if remote_workdir and not Path(remote_workdir).is_absolute():
-        raise ValueError("cluster mode requires an absolute --remote-workdir when provided")
-
-
 def main() -> int:
     args = parse_args()
     mix_indices = build_mix_indices(args.mix_start, args.mix_end)
-    gpu_ids = parse_gpu_ids(args.gpu_ids)
-    worker_limit = resolve_worker_limit(args.max_workers, mix_indices)
-    hosts = parse_hosts(args.hosts)
-
     workdir = str(Path(args.workdir).resolve())
     if args.scheduler_mode == "cluster":
         validate_cluster_mode_paths(workdir, args.remote_workdir)
@@ -703,6 +432,16 @@ def main() -> int:
     resolved_log_dir = resolve_path(args.log_dir, workdir)
     resolved_summary_dir = resolve_path(args.summary_dir, workdir)
     state_file = resolve_path(args.state_file, workdir) if args.state_file else default_state_file(resolved_summary_dir)
+    slots_file = resolve_path(args.slots_file, workdir)
+    slot_plan = read_slot_plan_file(slots_file)
+    slots = list(slot_plan.slots)
+
+    if not slots:
+        raise RuntimeError(f"slot plan contains no schedulable slots: {slots_file}")
+    if slot_plan.scheduler_mode != args.scheduler_mode:
+        raise ValueError(
+            f"slot plan mode mismatch: slots_file={slot_plan.scheduler_mode} executor={args.scheduler_mode}"
+        )
 
     cfg = WorkerConfig(
         scheduler_mode=args.scheduler_mode,
@@ -726,23 +465,14 @@ def main() -> int:
         passthrough_env=build_passthrough_env(args.passthrough_env),
     )
 
-    slots, scan_errors = build_worker_slots(
-        scheduler_mode=args.scheduler_mode,
-        hosts=hosts,
-        gpu_ids=gpu_ids,
-        connect_timeout=args.ssh_connect_timeout,
-        probe_timeout=args.ssh_probe_timeout,
-        max_workers=worker_limit,
-    )
-
     print(
-        f"[scheduler] mode={cfg.scheduler_mode} workers={len(slots)} "
-        f"target_workers={worker_limit} mixes={len(mix_indices)}"
+        f"[train_executor] mode={cfg.scheduler_mode} workers={len(slots)} "
+        f"requested_workers={slot_plan.requested_workers} mixes={len(mix_indices)}"
     )
     if cfg.scheduler_mode == "cluster":
-        print("[scheduler] slots=" + ",".join(slot.label for slot in slots))
+        print("[train_executor] slots=" + ",".join(slot.label for slot in slots))
 
-    state = initialize_state(cfg, slots, mix_indices, scan_errors)
+    state = initialize_state(cfg, slots, mix_indices, slot_plan.scan_errors, slots_file)
     write_state_file(state_file, state)
 
     task_queue: "mp.Queue[Optional[int]]" = mp.Queue()
@@ -791,14 +521,16 @@ def main() -> int:
     results.sort(key=lambda item: int(item["mix_index"]))
     failed = [result for result in results if int(result["return_code"]) != 0]
     report = {
+        "executor": "parallel_train.py",
         "scheduler_mode": cfg.scheduler_mode,
+        "slot_plan_file": slots_file,
         "state_file": state_file,
         "total": len(results),
         "succeeded": len(results) - len(failed),
         "failed": len(failed),
         "failed_mix_indices": [int(result["mix_index"]) for result in failed],
         "slots": [slot.label for slot in slots],
-        "scan_errors": scan_errors,
+        "scan_errors": slot_plan.scan_errors,
         "failures": failed,
     }
     print(json.dumps(report, ensure_ascii=True, indent=2))

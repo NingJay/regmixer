@@ -24,9 +24,9 @@
 #                                         ▼
 # ┌──────────────────────────────────────────────────────────────────────────┐
 # │ 3. 并行训练 15 个 variants                                               │
-# │   调用: scripts/parallel_train.py                                        │
+# │   调用: scripts/control_plane.py train                                   │
 # │   范围: mix 0..14                                                        │
-# │   资源: local/cluster 调度；cluster 下按空闲 GPU 自动起 worker           │
+# │   资源: control plane 先扫描空闲 GPU，再交给 train executor 执行         │
 # │   输出:                                                                  │
 # │     logs/        每个 run 的训练日志                                     │
 # │     summaries/   每个 run 的 summary.json                                │
@@ -486,8 +486,11 @@ TOTAL_VARIANTS=$((MIX_END - MIX_START + 1))
 GPU_IDS="${ROUND1A_GPU_IDS:-all}"
 SCHEDULER_MODE="${ROUND1A_SCHEDULER_MODE:-local}"
 ROUND1A_HOSTS="${ROUND1A_HOSTS:-hpcgpu09,hpcgpu10,hpcgpu11,hpcgpu12,hpcgpu13,hpcgpu14,hpcgpu15}"
+CONTROL_PLANE_STATE_FILE="${OUTPUT_DIR}/control_plane_state.json"
 PARALLEL_TRAIN_STATE_FILE="${OUTPUT_DIR}/parallel_train_state.json"
 PARALLEL_EVAL_STATE_FILE="${OUTPUT_DIR}/parallel_eval_state.json"
+TRAIN_SLOT_PLAN_FILE="${OUTPUT_DIR}/train_slot_plan.json"
+EVAL_SLOT_PLAN_FILE="${OUTPUT_DIR}/eval_slot_plan.json"
 GLOBAL_BATCH_SIZE=128
 EVAL_SCHEDULER_MODE="${EVAL_SCHEDULER_MODE:-cluster}"
 EVAL_HOSTS="${EVAL_HOSTS:-${ROUND1A_HOSTS}}"
@@ -518,9 +521,10 @@ echo "Start step: ${START_STEP}"
 echo "Output dir: ${OUTPUT_DIR}"
 echo "Train artifacts root: ${TRAIN_ROOT_DIR}"
 echo "Pipeline log: ${PIPELINE_LOG}"
-echo "Scheduler state: ${PARALLEL_TRAIN_STATE_FILE}"
+echo "Control-plane state: ${CONTROL_PLANE_STATE_FILE}"
+echo "Train executor state: ${PARALLEL_TRAIN_STATE_FILE}"
 echo "Eval scheduler mode: ${EVAL_SCHEDULER_MODE}"
-echo "Eval scheduler state: ${PARALLEL_EVAL_STATE_FILE}"
+echo "Eval executor state: ${PARALLEL_EVAL_STATE_FILE}"
 if [ "${EVAL_SCHEDULER_MODE}" = "cluster" ]; then
   echo "Eval host pool: ${EVAL_HOSTS}"
 fi
@@ -560,15 +564,17 @@ if [ "${START_STEP}" -le 2 ]; then
 
   export WANDB_MODE=offline
   PARALLEL_TRAIN_CMD=(
-    python scripts/parallel_train.py
+    python scripts/control_plane.py train
     --scheduler-mode "${SCHEDULER_MODE}"
+    --control-state-file "${CONTROL_PLANE_STATE_FILE}"
+    --slots-file "${TRAIN_SLOT_PLAN_FILE}"
     --config "${CONFIG_FILE}"
     --mix-file "${MIX_FILE}"
     --group-id "${GROUP_ID}"
     --run-name-prefix "${RUN_NAME_PREFIX}"
     --log-dir "${LOG_DIR}"
     --summary-dir "${SUMMARY_DIR}"
-    --state-file "${PARALLEL_TRAIN_STATE_FILE}"
+    --executor-state-file "${PARALLEL_TRAIN_STATE_FILE}"
     --mix-start "${MIX_START}"
     --mix-end "${MIX_END}"
     --gpu-ids "${GPU_IDS}"
@@ -624,11 +630,13 @@ if [ "${START_STEP}" -le 4 ]; then
   fi
 
   PARALLEL_EVAL_CMD=(
-    python scripts/parallel_eval.py
+    python scripts/control_plane.py eval
     --hf-manifest "${HF_MANIFEST}"
     --raw-results-dir "${RAW_RESULTS_DIR}"
     --log-dir "${EVAL_DIR}/eval_logs"
-    --state-file "${PARALLEL_EVAL_STATE_FILE}"
+    --control-state-file "${CONTROL_PLANE_STATE_FILE}"
+    --slots-file "${EVAL_SLOT_PLAN_FILE}"
+    --executor-state-file "${PARALLEL_EVAL_STATE_FILE}"
     --batch-size "${OLMES_BATCH_SIZE:-1}"
     --force-eval "${ROUND1A_FORCE_EVAL:-0}"
     --mix-start "${MIX_START}"

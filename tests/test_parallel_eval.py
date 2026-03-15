@@ -3,8 +3,6 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 
 def load_parallel_eval_module():
     module_path = Path(__file__).resolve().parents[1] / "scripts" / "parallel_eval.py"
@@ -17,20 +15,6 @@ def load_parallel_eval_module():
 
 
 parallel_eval = load_parallel_eval_module()
-
-
-def test_parse_gpu_ids_accepts_all():
-    assert parallel_eval.parse_gpu_ids("all") is None
-
-
-def test_resolve_worker_limit_defaults_to_task_count():
-    tasks = [
-        parallel_eval.EvalTask(model_name="model-a", hf_model_dir="/tmp/model-a", mix_index=0),
-        parallel_eval.EvalTask(model_name="model-b", hf_model_dir="/tmp/model-b", mix_index=1),
-    ]
-
-    assert parallel_eval.resolve_worker_limit(None, tasks) == 2
-    assert parallel_eval.resolve_worker_limit(1, tasks) == 1
 
 
 def test_build_task_list_filters_mix_range(tmp_path):
@@ -58,25 +42,6 @@ def test_verify_metrics_complete_requires_expected_task_count(tmp_path):
 
     assert parallel_eval.verify_metrics_complete(metrics_file, expected_tasks=3)
     assert not parallel_eval.verify_metrics_complete(metrics_file, expected_tasks=4)
-
-
-def test_build_worker_slots_discovers_local_gpus_when_gpu_ids_are_omitted(monkeypatch):
-    def fake_discover_local_gpu_ids():
-        return [0, 1, 2]
-
-    monkeypatch.setattr(parallel_eval, "discover_local_gpu_ids", fake_discover_local_gpu_ids)
-
-    slots, scan_errors = parallel_eval.build_worker_slots(
-        scheduler_mode="local",
-        hosts=[],
-        gpu_ids=None,
-        connect_timeout=5,
-        probe_timeout=5,
-        max_workers=2,
-    )
-
-    assert [slot.gpu_id for slot in slots] == [0, 1]
-    assert scan_errors == {}
 
 
 def test_build_remote_task_command_contains_expected_remote_bootstrap(tmp_path):
@@ -116,16 +81,6 @@ def test_build_remote_task_command_contains_expected_remote_bootstrap(tmp_path):
     assert task.hf_model_dir in task_cmd
 
 
-def test_run_remote_capture_times_out_probe(monkeypatch):
-    def fake_run(*args, **kwargs):
-        raise parallel_eval.subprocess.TimeoutExpired(cmd="ssh hpcgpu12 ...", timeout=9)
-
-    monkeypatch.setattr(parallel_eval.subprocess, "run", fake_run)
-
-    with pytest.raises(RuntimeError, match=r"ssh probe timed out for hpcgpu12 after 9s"):
-        parallel_eval.run_remote_capture("hpcgpu12", "nvidia-smi", connect_timeout=5, probe_timeout=9)
-
-
 def test_state_file_tracks_cached_completion(tmp_path):
     state_path = tmp_path / "parallel_eval_state.json"
     cfg = parallel_eval.EvalWorkerConfig(
@@ -144,7 +99,14 @@ def test_state_file_tracks_cached_completion(tmp_path):
         hf_model_dir=str(tmp_path / "hf_models" / "round1a-train-0000-step11445-hf"),
         mix_index=0,
     )
-    state = parallel_eval.initialize_state(cfg, [slot], [task], str(tmp_path / "hf_models_manifest.csv"), {})
+    state = parallel_eval.initialize_state(
+        cfg,
+        [slot],
+        [task],
+        str(tmp_path / "hf_models_manifest.csv"),
+        {},
+        str(tmp_path / "eval_slot_plan.json"),
+    )
 
     parallel_eval.apply_event_to_state(
         state,
@@ -171,6 +133,7 @@ def test_state_file_tracks_cached_completion(tmp_path):
 
     payload = json.loads(state_path.read_text(encoding="utf-8"))
 
+    assert payload["slot_plan_file"].endswith("eval_slot_plan.json")
     assert payload["tasks"]["0"]["status"] == "cached"
     assert payload["tasks"]["0"]["host"] == "hpcgpu09"
     assert payload["tasks"]["0"]["return_code"] == 0
