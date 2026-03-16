@@ -10,6 +10,8 @@
 - Eval executor: `scripts/parallel_eval.py`
 - Single-variant executor: `scripts/run_local_variant.py`
 - Round1a entrypoint: `scripts/run_round1a.sh`
+- Round1a fit visualizer: `scripts/visualize_round1a_results.py`
+- Round1a fit compare visualizer: `scripts/visualize_round1a_fit_comparison.py`
 - Shared host pool default: `hpcgpu09,hpcgpu10,hpcgpu11,hpcgpu12,hpcgpu13,hpcgpu14,hpcgpu15`
 - Unified control state: `control_plane_state.json`
 - Executor state files: `parallel_train_state.json`, `parallel_eval_state.json`
@@ -28,6 +30,7 @@
 - Read `control_plane_state.json`, the relevant executor state file, and the per-task logs before changing scheduling or reporting a failure.
 - Prefer targeted verification over full-suite testing. Default ladder: edited-file syntax check or focused pytest, then local control-plane integration tests, then 1-mix real cluster smoke, then wider cluster occupancy only after the 1-mix run is healthy.
 - Classify failures before redesigning the harness: `control-plane/probe`, `executor/runtime API drift`, or `training logic`.
+- For round1a fitting, treat `p_star_actual_quality.json` as the canonical downstream artifact. Treat `fit_compare/` as diagnostics only.
 
 ## Default workflow
 
@@ -41,6 +44,7 @@
 8. Use `.agents/docs/cluster-runtime-triage.md` when a real run fails or appears to hang.
 9. Monitor `control_plane_state.json`, `parallel_train_state.json`, `parallel_eval_state.json`, `outputs/.../logs/*.log`, `outputs/.../summaries/*.json`, and `eval/eval_logs/*.log`.
 10. Only contact the user when a task hits an authorization boundary or a non-trivial failure.
+11. When round1a fit diagnostics are requested, keep `ROUND1A_FIT_REGRESSION_TYPE` explicit and enable `ROUND1A_COMPARE_REGRESSIONS=1`.
 
 ## Natural-Language Launch Contract
 

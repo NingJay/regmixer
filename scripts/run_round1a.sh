@@ -69,17 +69,23 @@
 # │ 7. 拟合最优 actual 质量桶配比                                             │
 # │   调用: python -m regmixer.cli fit-mixture                               │
 # │   输入: eval_metrics.csv                                                 │
-# │   输出: p_star_actual_quality.json                                       │
+# │   输出:                                                                  │
+# │     p_star_actual_quality.json      官方/下游消费的单方法拟合结果         │
+# │     fit_compare/*.json              可选的多回归诊断输出                  │
 # │   结果: 给出 p*_actual_quality，供下一轮实验或正式训练使用               │
 # └──────────────────────────────────────────────────────────────────────────┘
 #                                         │
 #                                         ▼
 # ┌──────────────────────────────────────────────────────────────────────────┐
 # │ 8. 生成 round1a 标准可视化                                                │
-# │   调用: python scripts/visualize_round1a_results.py                      │
+# │   调用:                                                                  │
+# │     python scripts/visualize_round1a_results.py                          │
+# │     python scripts/visualize_round1a_fit_comparison.py  (可选)           │
 # │   输入: eval_metrics.csv + p_star_actual_quality.json                    │
-# │   输出: visualizations/*.png + visualizations/*.json                     │
-# │   结果: 生成按 repo 标准聚合后的 simplex / heatmap / 权重对比图          │
+# │   输出:                                                                  │
+# │     visualizations/*.png + visualizations/*.json                         │
+# │     fit_compare/visualizations/*.png + *.json  (可选)                    │
+# │   结果: 生成官方 p* 图，以及多回归 compare 的诊断图                      │
 # └──────────────────────────────────────────────────────────────────────────┘
 #
 #   恢复机制:
@@ -106,6 +112,10 @@
 #   EVAL_GPU_IDS="all"  # 并行评测使用的 GPU（默认：每台 host 自动发现全部可用 GPU）
 #   OLMES_BATCH_SIZE=1  # OLMES 评测 batch size（默认：1）
 #   ROUND1A_FORCE_EVAL=0  # 即使 metrics.json 存在也重新评测（1=强制，0=复用，默认：0）
+#   ROUND1A_FIT_REGRESSION_TYPE=quadratic  # 官方 p* 使用的回归器：quadratic/log_linear/lightgbm
+#   ROUND1A_COMPARE_REGRESSIONS=1  # 额外生成三路 compare 结果和对比图
+#   ROUND1A_FIT_SEARCH_SAMPLES=200000  # fit-mixture 的 Dirichlet 搜索样本数
+#   ROUND1A_FIT_SEED=42  # fit-mixture 的随机种子
 # ============================================================================
 
 set -e
@@ -462,6 +472,13 @@ SUMMARY_DIR="${OUTPUT_DIR}/summaries"
 EVAL_CSV="${OUTPUT_DIR}/eval_metrics.csv"
 P_STAR_OUTPUT="${OUTPUT_DIR}/p_star_actual_quality.json"
 VISUALIZATION_DIR="${OUTPUT_DIR}/visualizations"
+FIT_REGRESSION_TYPE="${ROUND1A_FIT_REGRESSION_TYPE:-quadratic}"
+COMPARE_REGRESSIONS="${ROUND1A_COMPARE_REGRESSIONS:-0}"
+FIT_SEARCH_SAMPLES="${ROUND1A_FIT_SEARCH_SAMPLES:-200000}"
+FIT_SEED="${ROUND1A_FIT_SEED:-42}"
+FIT_COMPARE_DIR="${OUTPUT_DIR}/fit_compare"
+FIT_COMPARE_SUMMARY="${FIT_COMPARE_DIR}/comparison_summary.json"
+FIT_COMPARE_VISUALIZATION_DIR="${FIT_COMPARE_DIR}/visualizations"
 EVAL_DIR="${OUTPUT_DIR}/eval"
 HF_CACHE_DIR="${EVAL_DIR}/hf_models"
 HF_MANIFEST="${EVAL_DIR}/hf_models_manifest.csv"
@@ -505,6 +522,17 @@ if [[ "${EVAL_SCHEDULER_MODE}" != "local" && "${EVAL_SCHEDULER_MODE}" != "cluste
   exit 1
 fi
 
+if [[ "${FIT_REGRESSION_TYPE}" != "quadratic" && "${FIT_REGRESSION_TYPE}" != "log_linear" && "${FIT_REGRESSION_TYPE}" != "lightgbm" ]]; then
+  echo "[ERROR] ROUND1A_FIT_REGRESSION_TYPE must be one of: quadratic, log_linear, lightgbm."
+  echo "        Got: ${FIT_REGRESSION_TYPE}"
+  exit 1
+fi
+
+if [[ "${COMPARE_REGRESSIONS}" != "0" && "${COMPARE_REGRESSIONS}" != "1" ]]; then
+  echo "[ERROR] ROUND1A_COMPARE_REGRESSIONS must be 0 or 1. Got: ${COMPARE_REGRESSIONS}"
+  exit 1
+fi
+
 echo "============================================================================"
 echo "Round-1a: Actual 质量桶比例搜索"
 echo "============================================================================"
@@ -513,6 +541,8 @@ echo "Config: ${CONFIG_FILE}"
 echo "Variants: ${MIX_START}-${MIX_END} (${TOTAL_VARIANTS} total)"
 echo "Scheduler mode: ${SCHEDULER_MODE}"
 echo "GPU selection: ${GPU_IDS}"
+echo "Fit regression: ${FIT_REGRESSION_TYPE}"
+echo "Compare regressions: ${COMPARE_REGRESSIONS}"
 if [ "${SCHEDULER_MODE}" = "cluster" ]; then
   echo "Host pool: ${ROUND1A_HOSTS}"
   echo "Target immediate workers: ${TOTAL_VARIANTS} (one per variant when enough idle GPUs exist)"
@@ -668,11 +698,27 @@ fi
 
 # Step 5: 用聚合后的 eval CSV 拟合最优 mixture，输出 p*。
 if [ "${START_STEP}" -le 5 ]; then
-  echo "[Step 5/6] Fitting regression model..."
+  echo "[Step 5/6] Fitting regression model (${FIT_REGRESSION_TYPE})..."
   PYTHONPATH=src python -m regmixer.cli fit-mixture \
     --config "${CONFIG_FILE}" \
     --eval-metrics "${EVAL_CSV}" \
-    --output "${P_STAR_OUTPUT}"
+    --output "${P_STAR_OUTPUT}" \
+    --regression-type "${FIT_REGRESSION_TYPE}" \
+    --search-samples "${FIT_SEARCH_SAMPLES}" \
+    --seed "${FIT_SEED}"
+
+  if [ "${COMPARE_REGRESSIONS}" = "1" ]; then
+    echo "[Step 5/6] Writing comparison diagnostics (quadratic/log_linear/lightgbm)..."
+    PYTHONPATH=src python -m regmixer.cli fit-mixture \
+      --config "${CONFIG_FILE}" \
+      --eval-metrics "${EVAL_CSV}" \
+      --output "${FIT_COMPARE_SUMMARY}" \
+      --output-dir "${FIT_COMPARE_DIR}" \
+      --regression-type "${FIT_REGRESSION_TYPE}" \
+      --compare-regressions \
+      --search-samples "${FIT_SEARCH_SAMPLES}" \
+      --seed "${FIT_SEED}"
+  fi
 
   echo "✓ Regression completed: ${P_STAR_OUTPUT}"
   echo ""
@@ -691,7 +737,18 @@ PYTHONPATH=src python scripts/visualize_round1a_results.py \
   --fit-json "${P_STAR_OUTPUT}" \
   --output-dir "${VISUALIZATION_DIR}"
 
+if [ "${COMPARE_REGRESSIONS}" = "1" ]; then
+  require_file "${FIT_COMPARE_SUMMARY}"
+  PYTHONPATH=src python scripts/visualize_round1a_fit_comparison.py \
+    --eval-metrics "${EVAL_CSV}" \
+    --fit-comparison-json "${FIT_COMPARE_SUMMARY}" \
+    --output-dir "${FIT_COMPARE_VISUALIZATION_DIR}"
+fi
+
 echo "✓ Visualizations completed: ${VISUALIZATION_DIR}"
+if [ "${COMPARE_REGRESSIONS}" = "1" ]; then
+  echo "✓ Comparison visualizations completed: ${FIT_COMPARE_VISUALIZATION_DIR}"
+fi
 echo ""
 
 # Display results
@@ -704,6 +761,12 @@ echo ""
 echo "Next steps:"
 echo "  1. Review ${P_STAR_OUTPUT}"
 echo "  2. Review visualizations under ${VISUALIZATION_DIR}"
-echo "  3. Copy weights to nemotron-cc-round1b-kind2.yaml (actual topics)"
-echo "  4. Run Round-1b: scripts/run_round1b.sh"
+if [ "${COMPARE_REGRESSIONS}" = "1" ]; then
+  echo "  3. Review compare diagnostics under ${FIT_COMPARE_DIR}"
+  echo "  4. Copy selected weights to nemotron-cc-round1b-kind2.yaml (actual topics)"
+  echo "  5. Run Round-1b: scripts/run_round1b.sh"
+else
+  echo "  3. Copy weights to nemotron-cc-round1b-kind2.yaml (actual topics)"
+  echo "  4. Run Round-1b: scripts/run_round1b.sh"
+fi
 echo "============================================================================"

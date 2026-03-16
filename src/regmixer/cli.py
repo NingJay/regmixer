@@ -493,7 +493,14 @@ def eval_command(
     "--output",
     type=click.Path(),
     required=True,
-    help="Output JSON path for proposed mixture weights.",
+    help="Output JSON path. In compare mode this is the summary JSON path.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(),
+    required=False,
+    default=None,
+    help="Optional artifact root. In compare mode, per-method JSON files are written under <output-dir>/methods/.",
 )
 @click.option(
     "--mix-file",
@@ -525,14 +532,31 @@ def eval_command(
     show_default=True,
     help="Random seed for search.",
 )
+@click.option(
+    "--regression-type",
+    type=click.Choice(["quadratic", "log_linear", "lightgbm"], case_sensitive=False),
+    required=False,
+    default="quadratic",
+    show_default=True,
+    help="Regression family used to fit the local surface.",
+)
+@click.option(
+    "--compare-regressions",
+    is_flag=True,
+    default=False,
+    help="Also run quadratic, log-linear, and lightgbm side-by-side and write a comparison summary.",
+)
 def fit_mixture_command(
     config: Path,
     eval_metrics: Path,
     output: Path,
+    output_dir: Optional[Path],
     mix_file: Optional[Path],
     metric_columns: Optional[str],
     search_samples: int,
     seed: int,
+    regression_type: str,
+    compare_regressions: bool,
 ):
     """Fit a local regression surface and propose p* weights from eval CSV."""
     from regmixer.local_fit import run_local_fit
@@ -541,10 +565,13 @@ def fit_mixture_command(
         config_path=config,
         eval_metrics=eval_metrics,
         output=output,
+        output_dir=output_dir,
         mix_file=mix_file,
         metric_columns=metric_columns,
         search_samples=search_samples,
         seed=seed,
+        regression_type=regression_type,
+        compare_regressions=compare_regressions,
     )
 
 

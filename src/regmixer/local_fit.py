@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -11,6 +12,21 @@ import pandas as pd
 from regmixer.eval.task_standards import ROUND1A_STANDARD_METRICS, build_round1a_standard_metrics
 
 logger = logging.getLogger(__name__)
+
+SUPPORTED_REGRESSION_TYPES = ("quadratic", "log_linear", "lightgbm")
+DEFAULT_COMPARE_REGRESSION_TYPES = ("quadratic", "log_linear", "lightgbm")
+
+METHOD_NAMES = {
+    "quadratic": "quadratic_regression_dirichlet_search",
+    "log_linear": "log_linear_regression_dirichlet_search",
+    "lightgbm": "lightgbm_regression_dirichlet_search",
+}
+
+
+@dataclass(frozen=True)
+class FitOutputPaths:
+    summary_output: Path
+    method_outputs: dict[str, Path]
 
 
 def _infer_mix_file(eval_metrics: Path, mix_file: Optional[Path]) -> Path:
@@ -88,6 +104,186 @@ def _predict_quadratic(x: np.ndarray, coeffs: np.ndarray) -> np.ndarray:
     return design @ coeffs
 
 
+def _fit_eval_regression(regression_type: str, x: np.ndarray, y: np.ndarray) -> Any:
+    try:
+        from regmixer.regression_models import build_local_regression
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            f"Regression type '{regression_type}' requires optional dependency '{exc.name}'. "
+            "Activate the regmixer environment before running fit-mixture."
+        ) from exc
+
+    return build_local_regression(regression_type=regression_type, x=x, y=y)
+
+
+def _predict_eval_regression(model: Any, x: np.ndarray) -> np.ndarray:
+    predictions = np.asarray(model.predict(x), dtype=np.float64).reshape(-1)
+    if predictions.shape[0] != x.shape[0]:
+        raise RuntimeError(
+            f"Regression model returned {predictions.shape[0]} predictions for {x.shape[0]} rows."
+        )
+    return predictions
+
+
+def _resolve_regression_types(
+    regression_type: str,
+    compare_regressions: bool,
+) -> list[str]:
+    if regression_type not in SUPPORTED_REGRESSION_TYPES:
+        raise ValueError(
+            f"Unsupported regression type '{regression_type}'. "
+            f"Expected one of: {', '.join(SUPPORTED_REGRESSION_TYPES)}"
+        )
+
+    if compare_regressions:
+        return list(DEFAULT_COMPARE_REGRESSION_TYPES)
+
+    return [regression_type]
+
+
+def _build_candidate_weights(x: np.ndarray, search_samples: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    random_candidates = rng.dirichlet(np.ones(x.shape[1]), size=max(1, int(search_samples)))
+    corners = np.eye(x.shape[1])
+    return np.concatenate([x, random_candidates, corners], axis=0)
+
+
+def _extract_regression_parameters(
+    regression_type: str,
+    model_or_coeffs: Any,
+) -> Optional[list[float]]:
+    if regression_type == "quadratic":
+        return np.asarray(model_or_coeffs, dtype=np.float64).tolist()
+
+    raw_model = getattr(model_or_coeffs, "model", None)
+    if raw_model is None:
+        return None
+    if isinstance(raw_model, np.ndarray):
+        return raw_model.astype(np.float64).tolist()
+    if isinstance(raw_model, (list, tuple)):
+        return [float(value) for value in raw_model]
+
+    params = getattr(raw_model, "params", None)
+    if params is not None:
+        return np.asarray(params, dtype=np.float64).tolist()
+
+    return None
+
+
+def _extract_regression_metadata(regression_type: str, model: Any) -> Optional[dict[str, Any]]:
+    if regression_type != "lightgbm":
+        return None
+
+    estimator = getattr(model, "model", None)
+    if estimator is None:
+        return None
+
+    metadata: dict[str, Any] = {}
+    feature_importances = getattr(estimator, "feature_importances_", None)
+    if feature_importances is not None:
+        metadata["feature_importances"] = np.asarray(feature_importances, dtype=np.int64).tolist()
+
+    n_estimators = getattr(estimator, "n_estimators_", None)
+    if n_estimators is not None:
+        metadata["n_estimators"] = int(n_estimators)
+
+    return metadata or None
+
+
+def _search_best_weights(
+    *,
+    regression_type: str,
+    x: np.ndarray,
+    y: np.ndarray,
+    candidates: np.ndarray,
+) -> tuple[np.ndarray, float, str, Optional[list[float]], Optional[dict[str, Any]]]:
+    if regression_type == "quadratic":
+        coeffs = _fit_quadratic_regression(x, y)
+        predictions = _predict_quadratic(candidates, coeffs)
+        coeff_payload = _extract_regression_parameters(regression_type, coeffs)
+        metadata = None
+    else:
+        model = _fit_eval_regression(regression_type, x, y)
+        predictions = _predict_eval_regression(model, candidates)
+        coeff_payload = _extract_regression_parameters(regression_type, model)
+        metadata = _extract_regression_metadata(regression_type, model)
+
+    if not np.isfinite(predictions).any():
+        raise RuntimeError(f"Regression type '{regression_type}' produced no finite predictions.")
+
+    safe_predictions = np.where(np.isfinite(predictions), predictions, -np.inf)
+    best_idx = int(np.argmax(safe_predictions))
+    return (
+        candidates[best_idx],
+        float(safe_predictions[best_idx]),
+        METHOD_NAMES[regression_type],
+        coeff_payload,
+        metadata,
+    )
+
+
+def _resolve_output_paths(
+    *,
+    output: Path,
+    output_dir: Optional[Path],
+    regression_types: Sequence[str],
+    compare_regressions: bool,
+) -> FitOutputPaths:
+    output = Path(output)
+    artifact_root = Path(output_dir) if output_dir is not None else None
+
+    if compare_regressions:
+        summary_path = output if output.suffix else output / "comparison.json"
+        if artifact_root is None:
+            artifact_root = output if not output.suffix else output.parent / output.stem
+        methods_dir = artifact_root / "methods"
+        method_outputs = {
+            regression_name: methods_dir / f"{regression_name}.json"
+            for regression_name in regression_types
+        }
+        return FitOutputPaths(summary_output=summary_path, method_outputs=method_outputs)
+
+    regression_name = regression_types[0]
+    if artifact_root is not None:
+        filename = output.name if output.suffix else f"{regression_name}.json"
+        result_path = artifact_root / filename
+    elif output.suffix:
+        result_path = output
+    else:
+        result_path = output / f"{regression_name}.json"
+
+    return FitOutputPaths(summary_output=result_path, method_outputs={regression_name: result_path})
+
+
+def _build_result_summary(
+    *,
+    objective_name: str,
+    metrics: list[str],
+    results: dict[str, dict[str, Any]],
+    output_paths: dict[str, Path],
+) -> dict[str, Any]:
+    best_method = max(
+        results.items(),
+        key=lambda item: item[1]["predicted_best_score"],
+    )[0]
+
+    summary = {
+        "objective": objective_name,
+        "metric_columns": metrics,
+        "methods": {
+            regression_name: {
+                "output_path": str(output_paths[regression_name]),
+                "predicted_best_score": result["predicted_best_score"],
+                "best_observed_score": result["best_observed_score"],
+                "weights": result["weights"],
+            }
+            for regression_name, result in results.items()
+        },
+        "best_method_by_predicted_score": best_method,
+    }
+    return summary
+
+
 def _shrink_actual_prefix(weights: dict[str, float]) -> Optional[dict[str, float]]:
     if not weights:
         return None
@@ -132,14 +328,18 @@ def run_local_fit(
     config_path: Path,
     eval_metrics: Path,
     output: Path,
+    output_dir: Optional[Path],
     mix_file: Optional[Path],
     metric_columns: Optional[str],
     search_samples: int,
     seed: int,
+    regression_type: str,
+    compare_regressions: bool,
 ) -> Path:
     config_path = Path(config_path)
     eval_metrics = Path(eval_metrics)
     output = Path(output)
+    output_dir = Path(output_dir) if output_dir is not None else None
     mix_file = Path(mix_file) if mix_file is not None else None
     del config_path  # kept for interface compatibility with existing run scripts
 
@@ -171,22 +371,41 @@ def run_local_fit(
     x = df[weight_columns].to_numpy(dtype=np.float64)
     y = df["mean_score"].to_numpy(dtype=np.float64)
 
+    regression_types = _resolve_regression_types(regression_type, compare_regressions)
+    output_paths = _resolve_output_paths(
+        output=output,
+        output_dir=output_dir,
+        regression_types=regression_types,
+        compare_regressions=compare_regressions,
+    )
+    candidates = _build_candidate_weights(x, search_samples, seed) if x.shape[1] > 1 else x
+
     if x.shape[1] == 1:
-        proposed = np.array([1.0], dtype=np.float64)
-        coeffs = np.array([0.0], dtype=np.float64)
-        predicted = float(y.mean())
-        method = "single_domain_no_regression"
+        single_method_outputs = {}
+        for current_regression_type in regression_types:
+            single_method_outputs[current_regression_type] = {
+                "proposed": np.array([1.0], dtype=np.float64),
+                "predicted": float(y.mean()),
+                "method": "single_domain_no_regression",
+                "coefficients": [0.0],
+                "metadata": None,
+            }
     else:
-        coeffs = _fit_quadratic_regression(x, y)
-        rng = np.random.default_rng(seed)
-        random_candidates = rng.dirichlet(np.ones(x.shape[1]), size=max(1, int(search_samples)))
-        corners = np.eye(x.shape[1])
-        candidates = np.concatenate([x, random_candidates, corners], axis=0)
-        predictions = _predict_quadratic(candidates, coeffs)
-        best_idx = int(np.argmax(predictions))
-        proposed = candidates[best_idx]
-        predicted = float(predictions[best_idx])
-        method = "quadratic_regression_dirichlet_search"
+        single_method_outputs = {}
+        for current_regression_type in regression_types:
+            proposed, predicted, method, coefficients, metadata = _search_best_weights(
+                regression_type=current_regression_type,
+                x=x,
+                y=y,
+                candidates=candidates,
+            )
+            single_method_outputs[current_regression_type] = {
+                "proposed": proposed,
+                "predicted": predicted,
+                "method": method,
+                "coefficients": coefficients,
+                "metadata": metadata,
+            }
 
     best_observed_idx = int(np.argmax(y))
     best_observed_row = df.iloc[best_observed_idx]
@@ -194,32 +413,55 @@ def run_local_fit(
         col.replace("weight__", ""): float(best_observed_row[col]) for col in weight_columns
     }
 
-    proposed_weights = {
-        col.replace("weight__", ""): float(value) for col, value in zip(weight_columns, proposed)
-    }
-    topic_only = _shrink_actual_prefix(proposed_weights)
+    results: dict[str, dict[str, Any]] = {}
+    for current_regression_type, payload in single_method_outputs.items():
+        proposed_weights = {
+            col.replace("weight__", ""): float(value)
+            for col, value in zip(weight_columns, payload["proposed"])
+        }
+        topic_only = _shrink_actual_prefix(proposed_weights)
 
-    result = {
-        "method": method,
-        "objective": objective_name,
-        "num_runs": int(len(df)),
-        "num_domains": int(len(weight_columns)),
-        "num_metrics": int(len(metrics)),
-        "metric_columns": metrics,
-        "best_observed_run": str(best_observed_row.get("run_name", "")),
-        "best_observed_score": float(best_observed_row["mean_score"]),
-        "best_observed_weights": best_observed_weights,
-        "predicted_best_score": predicted,
-        "weights": proposed_weights,
-        "weights_sum": float(sum(proposed_weights.values())),
-        "regression_coefficients": coeffs.tolist(),
-    }
-    if topic_only is not None:
-        result["p_star_actual_quality"] = topic_only
+        result = {
+            "method": payload["method"],
+            "regression_type": current_regression_type,
+            "objective": objective_name,
+            "num_runs": int(len(df)),
+            "num_domains": int(len(weight_columns)),
+            "num_metrics": int(len(metrics)),
+            "metric_columns": metrics,
+            "best_observed_run": str(best_observed_row.get("run_name", "")),
+            "best_observed_score": float(best_observed_row["mean_score"]),
+            "best_observed_weights": best_observed_weights,
+            "predicted_best_score": payload["predicted"],
+            "weights": proposed_weights,
+            "weights_sum": float(sum(proposed_weights.values())),
+            "regression_parameters": payload["coefficients"],
+        }
+        if current_regression_type == "quadratic" and payload["coefficients"] is not None:
+            result["regression_coefficients"] = payload["coefficients"]
+        if payload["metadata"] is not None:
+            result["regression_metadata"] = payload["metadata"]
+        if topic_only is not None:
+            result["p_star_actual_quality"] = topic_only
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, sort_keys=True)
+        method_path = output_paths.method_outputs[current_regression_type]
+        method_path.parent.mkdir(parents=True, exist_ok=True)
+        with method_path.open("w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, sort_keys=True)
+        results[current_regression_type] = result
 
-    logger.info("Local fit output written to %s", output)
-    return output
+    if compare_regressions:
+        summary = _build_result_summary(
+            objective_name=objective_name,
+            metrics=metrics,
+            results=results,
+            output_paths=output_paths.method_outputs,
+        )
+        output_paths.summary_output.parent.mkdir(parents=True, exist_ok=True)
+        with output_paths.summary_output.open("w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+        logger.info("Local fit comparison output written to %s", output_paths.summary_output)
+        return output_paths.summary_output
+
+    logger.info("Local fit output written to %s", output_paths.summary_output)
+    return output_paths.summary_output
