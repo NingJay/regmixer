@@ -536,7 +536,7 @@ def eval_command(
     "--regression-type",
     type=click.Choice(["quadratic", "log_linear", "lightgbm"], case_sensitive=False),
     required=False,
-    default="quadratic",
+    default="log_linear",
     show_default=True,
     help="Regression family used to fit the local surface.",
 )

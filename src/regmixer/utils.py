@@ -23,7 +23,12 @@ from regmixer.aliases import (
     SourceConfig,
     SourceInstance,
 )
-from regmixer.synthesize_mixture import mk_mixtures
+from regmixer.experiment_design import (
+    default_design_output_dir,
+    default_design_summary_path,
+    write_design_artifacts,
+)
+from regmixer.synthesize_mixture import mk_mixtures_with_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -298,7 +303,7 @@ def mk_mixes(
         data = yaml.safe_load(f)
 
     config = ExperimentConfig(**data)
-    mixes = mk_mixtures(config, group_uuid, use_cache=use_cache)
+    mixes, design_artifacts = mk_mixtures_with_metadata(config, group_uuid, use_cache=use_cache)
     mix_string = prettify_mixes(mixes)
 
     if not output:
@@ -311,6 +316,14 @@ def mk_mixes(
             f.write(mix_string)
 
         logger.info(f"Mixes saved to {output}:")
+        design_summary_path = default_design_summary_path(Path(output))
+        design_output_dir = default_design_output_dir(Path(output))
+        write_design_artifacts(
+            design_artifacts,
+            summary_path=design_summary_path,
+            output_dir=design_output_dir,
+        )
+        logger.info(f"Design summary saved to {design_summary_path}")
 
     from copy import deepcopy
 

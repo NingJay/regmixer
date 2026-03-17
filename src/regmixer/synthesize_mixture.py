@@ -32,6 +32,12 @@ import json
 
 from regmixer.aliases import ExperimentConfig, SourceConfig
 from regmixer.data.parquet_utils import materialize_parquet_paths
+from regmixer.experiment_design import (
+    DesignArtifacts,
+    build_anchor_weights,
+    select_d_opt_design,
+    select_random_design,
+)
 
 
 class ConfigDefaults:
@@ -168,6 +174,160 @@ def sample_has_required_sources_and_topics(
     return True
 
 
+def _pick_candidate_strategy(strategy: str, accepted_count: int, vertex_prob: float) -> str:
+    if strategy != "mixed":
+        return strategy
+
+    total_slots = 10
+    vertex_slots = max(0, min(total_slots, int(round(vertex_prob * total_slots))))
+    remaining_slots = total_slots - vertex_slots
+    dirichlet_slots = remaining_slots // 2 + remaining_slots % 2
+    uniform_slots = remaining_slots - dirichlet_slots
+
+    slot = accepted_count % total_slots
+    if slot < dirichlet_slots:
+        return "dirichlet"
+    if slot < dirichlet_slots + uniform_slots:
+        return "uniform"
+    return "vertex_biased"
+
+
+def _sample_vertex_biased_simplex(
+    dim: int,
+    *,
+    rng: np.random.Generator,
+    min_dominant_weight: float,
+) -> np.ndarray:
+    if dim <= 0:
+        raise ValueError(f"simplex dimension must be positive, got {dim}")
+    if dim == 1:
+        return np.ones((1, 1), dtype=np.float64)
+
+    dominant_idx = int(rng.integers(dim))
+    dominant_weight = float(rng.uniform(min_dominant_weight, 1.0))
+    residual = max(0.0, 1.0 - dominant_weight)
+    candidate = np.zeros(dim, dtype=np.float64)
+    candidate[dominant_idx] = dominant_weight
+    if residual > 0.0:
+        tail = rng.dirichlet(np.ones(dim - 1, dtype=np.float64))
+        other_indices = [idx for idx in range(dim) if idx != dominant_idx]
+        for idx, value in zip(other_indices, tail):
+            candidate[idx] = residual * float(value)
+    return candidate.reshape(1, -1)
+
+
+def _sample_dirichlet_schedule(
+    *,
+    prior: np.ndarray,
+    min_strength: float,
+    max_strength: float,
+    rng: np.random.Generator,
+    fixed_weights: Optional[list[float]] = None,
+) -> list[np.ndarray]:
+    if fixed_weights is not None:
+        if min_strength == max_strength:
+            return [np.array([fixed_weights], dtype=np.float64)]
+        return [np.array([fixed_weights], dtype=np.float64) for _ in range(15)]
+
+    if min_strength == max_strength:
+        return [rng.dirichlet(prior * min_strength, 1)]
+
+    min_strength_log = np.log10(min_strength)
+    max_strength_log = np.log10(max_strength)
+    samples = []
+    for strength in np.logspace(min_strength_log, max_strength_log, 15):
+        samples.append(rng.dirichlet(prior * strength, 1))
+    return samples
+
+
+def _sample_distribution_schedule(
+    *,
+    strategy: str,
+    prior: np.ndarray,
+    min_strength: float,
+    max_strength: float,
+    rng: np.random.Generator,
+    min_dominant_weight: float,
+    fixed_weights: Optional[list[float]] = None,
+    num_repeats: int = 1,
+) -> list[np.ndarray]:
+    if strategy == "dirichlet":
+        return _sample_dirichlet_schedule(
+            prior=prior,
+            min_strength=min_strength,
+            max_strength=max_strength,
+            rng=rng,
+            fixed_weights=fixed_weights,
+        )
+
+    if fixed_weights is not None:
+        return [np.array([fixed_weights], dtype=np.float64) for _ in range(max(1, num_repeats))]
+
+    if strategy == "uniform":
+        return [rng.dirichlet(np.ones(len(prior), dtype=np.float64), 1)]
+
+    if strategy == "vertex_biased":
+        return [
+            _sample_vertex_biased_simplex(
+                len(prior),
+                rng=rng,
+                min_dominant_weight=min_dominant_weight,
+            )
+        ]
+
+    raise ValueError(f"Unsupported candidate sampling strategy: {strategy}")
+
+
+def _compute_repetition_factors(
+    *,
+    weights: np.ndarray,
+    prior_dist: np.ndarray,
+    total_available_tokens: int,
+    max_tokens: int,
+    allow_repetition: bool,
+    max_repetition_ratio: float,
+) -> Optional[np.ndarray]:
+    repetitions = np.ones(len(weights), dtype=np.float64)
+    if not allow_repetition:
+        return repetitions
+
+    per_domain_available_tokens = [
+        int(prior_dist[idx] * total_available_tokens) for idx in range(len(weights))
+    ]
+    for idx, domain_available_tokens in enumerate(per_domain_available_tokens):
+        required_tokens = int(weights[idx] * max_tokens)
+        repetition = (
+            np.ceil(required_tokens / domain_available_tokens * 1000) / 1000
+            if domain_available_tokens != 0
+            else 0
+        )
+        if repetition > max_repetition_ratio:
+            return None
+        repetitions[idx] = max(1, repetition)
+
+    return repetitions
+
+
+def _min_distance_to_samples(
+    candidate: np.ndarray,
+    samples: list[Tuple[np.ndarray, np.ndarray]],
+) -> float:
+    if not samples:
+        return float("inf")
+    return min(float(np.linalg.norm(sample[0] - candidate)) for sample in samples)
+
+
+def _append_unique_sample(
+    pool: list[Tuple[np.ndarray, np.ndarray]],
+    sample: Tuple[np.ndarray, np.ndarray],
+    *,
+    threshold: float = 1e-9,
+) -> bool:
+    if _min_distance_to_samples(sample[0], pool) < threshold:
+        return False
+    pool.append(sample)
+    return True
+
 
 def generate_weights_dirichlet(
     sources: list[SourceConfig], # flat 
@@ -189,7 +349,21 @@ def generate_weights_dirichlet(
     enable_bound: bool = True,
     nonzero_weight: Optional[list[str]] = None,
     fixed_source_weights: Optional[dict[str, float]] = None,
-    existing_mix_file: Optional[str] = None
+    existing_mix_file: Optional[str] = None,
+    max_repetition_ratio: float = ConfigDefaults.maximum_repetition,
+    candidate_sampling_strategy: str = "dirichlet",
+    candidate_pool_size: Optional[int] = None,
+    candidate_random_seed: Optional[int] = None,
+    candidate_vertex_prob: float = 0.3,
+    candidate_min_dominant_weight: float = 0.7,
+    candidate_min_config_distance: float = 0.0,
+    design_selection_method: str = "random",
+    design_basis: str = "quadratic_logratio_2d",
+    design_random_seed: Optional[int] = None,
+    design_ridge: float = 1e-6,
+    design_log_floor: float = 1e-4,
+    design_min_selected_distance: float = 0.0,
+    design_anchor_points: Optional[list[str]] = None,
 ):
     """
     Generate weights for each domain group using a dirichlet distribution.
@@ -203,12 +377,15 @@ def generate_weights_dirichlet(
     collected_samples: list[Tuple[np.ndarray, np.ndarray]] = []
     weight_bounds = None
 
-
     prior_dist = np.array([v for _, v in leaf_dist.items()])
     logger.info(f"Dimension of leaf-level distribution: {len(prior_dist)}")
     domains = [k for k, _ in leaf_dist.items()]
     source_names = [source.name for source in sources]
     idx_to_level = ["source" if name in source_names else "topic" for name in leaf_dist]
+    candidate_rng = np.random.default_rng(candidate_random_seed)
+    design_seed = design_random_seed if design_random_seed is not None else candidate_random_seed
+    if design_seed is None:
+        design_seed = 42
 
     if enable_bound:
         # weight bounds are at the leaf level and computed using the number of available tokens per source/topic.
@@ -278,153 +455,140 @@ def generate_weights_dirichlet(
                 fixed_topic_weights[source.name] = conditional_weight
 
     sample_multiplier = sample_multiplier if sample_multiplier else ConfigDefaults.sample_multiplier
+    target_candidate_count = candidate_pool_size if candidate_pool_size else num_samples_out * sample_multiplier
+    max_attempts = max(target_candidate_count * 50, target_candidate_count + 1)
 
     if fixed_source_weights is not None:
         fixed_source_weights = [fixed_source_weights[source_config.name] for source_config in sorted(sources, key=lambda x: x.name)]
 
-
+    valid_existing_mixes = None
     if existing_mix_file is not None:
         ratios = pd.read_pickle(existing_mix_file)
         valid_existing_mixes = ratios[ratios[domains].sum(axis=1) == 1][domains].values # keep the rows that have probabilities that add up to 1 on the domains we're mixing on
-    for _ in tqdm(range(num_samples_out * sample_multiplier)):
-        candidates = []
+    attempts = 0
+    while len(collected_samples) < target_candidate_count and attempts < max_attempts:
+        attempts += 1
+        active_strategy = _pick_candidate_strategy(
+            candidate_sampling_strategy,
+            len(collected_samples),
+            candidate_vertex_prob,
+        )
+        source_samples = _sample_distribution_schedule(
+            strategy=active_strategy,
+            prior=source_prior,
+            min_strength=min_source_strength,
+            max_strength=max_source_strength,
+            rng=candidate_rng,
+            min_dominant_weight=candidate_min_dominant_weight,
+            fixed_weights=fixed_source_weights,
+        )
 
-        # first, generate source-level weights
-        if min_source_strength == max_source_strength:
-            if fixed_source_weights is not None:
-                # if we have fixed source weights, we use those
-                source_samples = np.array([fixed_source_weights])
-            else:
-                source_samples = np.random.dirichlet(source_prior * min_source_strength, 1)
-        else:
-            source_samples = []
-            if fixed_source_weights is not None:
-                for _ in range(15):
-                    source_samples.append(np.array([fixed_source_weights]))
-            else:
-                min_source_strength_log = np.log10(min_source_strength)
-                max_source_strength_log = np.log10(max_source_strength)
-                for strength in np.logspace(min_source_strength_log, max_source_strength_log, 15):
-                    samples_per_strength = np.random.dirichlet(source_prior * strength, 1)
-                    source_samples.append(samples_per_strength)
-
-
-        # then, generate topic-level weights
         topic_samples = defaultdict(list)
         for source, topic_prior in topic_priors.items():
+            conditional_weight = None
             if source in fixed_topic_weights:
-                # this source has fixed topic weights, so we use those
-                conditional_weight = fixed_topic_weights[source]
-                if min_topic_strength == max_topic_strength:
-                    topic_samples[source].append(conditional_weight)
-                else:
-                    for _ in range(15):
-                        topic_samples[source].append(conditional_weight)
-                continue
+                conditional_weight = fixed_topic_weights[source][0].tolist()
+            topic_samples[source] = _sample_distribution_schedule(
+                strategy=active_strategy,
+                prior=topic_prior,
+                min_strength=min_topic_strength,
+                max_strength=max_topic_strength,
+                rng=candidate_rng,
+                min_dominant_weight=candidate_min_dominant_weight,
+                fixed_weights=conditional_weight,
+                num_repeats=len(source_samples),
+            )
 
-            if min_topic_strength == max_topic_strength:
-                topic_samples[source].append(np.random.dirichlet(topic_prior * min_topic_strength, 1))
-            else:
-                min_topic_strength_log = np.log10(min_topic_strength)
-                max_topic_strength_log = np.log10(max_topic_strength)
-                for strength in np.logspace(min_topic_strength_log, max_topic_strength_log, 15):
-                    samples_per_strength = np.random.dirichlet(topic_prior * strength, 1)
-                    topic_samples[source].append(samples_per_strength)
+        flattened_candidates = []
+        for sample_idx, source_sample in enumerate(source_samples):
+            leaf_level_sample = {
+                source: samples[min(sample_idx, len(samples) - 1)][0] * source_sample[0, source_idx]
+                for source_idx, (source, samples) in enumerate(topic_samples.items())
+            }
+            flattened_candidates.append(
+                np.concatenate([arr for arr in list(leaf_level_sample.values())]).reshape(1, -1)
+            )
 
-        # convert from source_samples and topic_samples back to a set of leaf-level samples 
-        candidates = []
-        for i, source_sample in enumerate(source_samples):
-            leaf_level_sample = {source: samples[i][0]*source_sample[0, j] for j, (source, samples) in enumerate(topic_samples.items())}
-            flattened_sample = np.concatenate([arr for arr in list(leaf_level_sample.values())]).reshape(1, -1)
-            candidates.append(flattened_sample)
-            
-        filtered_candidates = []
-
-        # If we don't allow repetition, we need to filter out candidates that are outside the bounds
         if weight_bounds and not allow_repetition:
             filtered_candidates = [
                 sample
-                for sample in candidates
+                for sample in flattened_candidates
                 if all(
                     lower <= sample[0][idx] <= upper
                     for idx, (lower, upper) in enumerate(weight_bounds)
                 )
             ]
         else:
-            filtered_candidates = candidates
+            filtered_candidates = flattened_candidates
 
         if nonzero_weight:
-            source_names = set(nonzero_weight)
-            # Filter candidates
+            required_domains = set(nonzero_weight)
             filtered_candidates = [
-                sample for sample in filtered_candidates
-                if sample_has_required_sources_and_topics(sample[0], domains, source_names, minimum_source_weight, minimum_topic_weight)
+                sample
+                for sample in filtered_candidates
+                if sample_has_required_sources_and_topics(
+                    sample[0],
+                    domains,
+                    required_domains,
+                    minimum_source_weight,
+                    minimum_topic_weight,
+                )
             ]
 
         if not filtered_candidates:
-            # logger.warning("No candidates left after filtering according to weight bounds and nonzero weights!")
             continue
 
-        candidates = random.choice(filtered_candidates)
+        candidate = filtered_candidates[int(candidate_rng.integers(len(filtered_candidates)))]
 
         if minimum_source_weight == minimum_topic_weight:
-            candidates = np.where(candidates < minimum_source_weight, 0, candidates)
-            candidates = candidates / np.sum(candidates).reshape(-1, 1)
-            candidates = np.round(candidates / minimum_source_weight) * minimum_source_weight
-            candidates = candidates / np.sum(candidates)
+            candidate = np.where(candidate < minimum_source_weight, 0, candidate)
+            candidate = candidate / np.sum(candidate).reshape(-1, 1)
+            candidate = np.round(candidate / minimum_source_weight) * minimum_source_weight
+            candidate = candidate / np.sum(candidate)
         else:
-            candidates = clip_candidates_by_level(
-                candidates,
+            candidate = clip_candidates_by_level(
+                candidate,
                 idx_to_level,
                 domains,
                 minimum_source_weight,
                 minimum_topic_weight,
-                fixed_topic_weights
+                fixed_topic_weights,
             )
 
         if weight_bounds and not allow_repetition:
-            # need to check for out-of-bounds candidates again, in case normalization caused bounds to be violated.
-            if any(candidates[0][idx] < lower or candidates[0][idx] > upper for idx, (lower, upper), in enumerate(weight_bounds)):
+            if any(
+                candidate[0][idx] < lower or candidate[0][idx] > upper
+                for idx, (lower, upper) in enumerate(weight_bounds)
+            ):
                 continue
 
-        selected: Tuple[np.ndarray, np.ndarray] = (
-            candidates[0],
-            np.ones(candidates.shape[1]),
-        )
-
-        # if selected is too close to an existing mix from existing_mix_file, discard it 
-        if existing_mix_file is not None:
-            dists = np.linalg.norm(valid_existing_mixes - candidates[0], axis=1)
+        if valid_existing_mixes is not None:
+            dists = np.linalg.norm(valid_existing_mixes - candidate[0], axis=1)
             if np.any(dists < 0.01):
-                logger.info(f"Candidate swarm run is too close to the mixes at {existing_mix_file}, rejecting.")
-                continue 
-
-        reject = False
-        if allow_repetition:
-            # Use a stable per-domain token budget; do not mutate the total token count
-            # inside the loop. Otherwise repetition factors can be silently miscomputed.
-            per_domain_available_tokens = [
-                int(prior_dist[idx] * total_available_tokens) for idx in range(len(domains))
-            ]
-
-            for idx, _ in enumerate(domains):
-                domain_available_tokens = per_domain_available_tokens[idx]
-                required_tokens = int(selected[0][idx] * max_tokens)
-
-                repetition = (
-                    np.ceil(required_tokens / domain_available_tokens * 1000) / 1000
-                    if domain_available_tokens != 0
-                    else 0
+                logger.info(
+                    "Candidate swarm run is too close to the mixes at %s, rejecting.",
+                    existing_mix_file,
                 )
+                continue
 
-                if repetition > ConfigDefaults.maximum_repetition:
-                    reject = True
-                    break
+        repetitions = _compute_repetition_factors(
+            weights=candidate[0],
+            prior_dist=prior_dist,
+            total_available_tokens=total_available_tokens,
+            max_tokens=max_tokens,
+            allow_repetition=allow_repetition,
+            max_repetition_ratio=max_repetition_ratio,
+        )
+        if repetitions is None:
+            continue
 
-                selected[1][idx] = max(1, repetition)
+        selected = (candidate[0], repetitions)
+        if candidate_min_config_distance > 0.0 and (
+            _min_distance_to_samples(selected[0], collected_samples) < candidate_min_config_distance
+        ):
+            continue
 
-        if not reject:
-            collected_samples.append(selected)
+        collected_samples.append(selected)
 
     if len(collected_samples) == 0:
         raise ValueError("No valid samples were generated, please check the configuration!")
@@ -435,13 +599,67 @@ def generate_weights_dirichlet(
     else:
         deduped = sort_and_deduplicate(collected_samples)
 
-    if len(collected_samples) < num_samples_out:
+    if len(deduped) < num_samples_out:
         raise ValueError(
-            f"The number of collected samples '{len(collected_samples)}' is less than the required number of samples '{num_samples_out}'!"
+            f"The number of deduplicated samples '{len(deduped)}' is less than the required number of samples '{num_samples_out}'!"
         )
 
-    selected_samples = random.sample(deduped, num_samples_out)
-    selected_samples = np.stack(selected_samples, axis=0)
+    anchor_samples: list[Tuple[np.ndarray, np.ndarray]] = []
+    if design_anchor_points:
+        for _, anchor in build_anchor_weights(len(domains), design_anchor_points):
+            repetitions = _compute_repetition_factors(
+                weights=anchor,
+                prior_dist=prior_dist,
+                total_available_tokens=total_available_tokens,
+                max_tokens=max_tokens,
+                allow_repetition=allow_repetition,
+                max_repetition_ratio=max_repetition_ratio,
+            )
+            if repetitions is None:
+                raise ValueError("Anchor point violates max_repetition_ratio; relax design anchors or repetition limits.")
+            anchor_samples.append((anchor, repetitions))
+
+    for anchor_sample in anchor_samples:
+        _append_unique_sample(deduped, anchor_sample)
+
+    candidate_weights = np.stack([sample[0] for sample in deduped], axis=0)
+    anchor_weight_defs = build_anchor_weights(len(domains), design_anchor_points or [])
+
+    if design_selection_method == "d_opt":
+        selection = select_d_opt_design(
+            candidate_weights,
+            domains=domains,
+            num_variants=num_samples_out,
+            basis=design_basis,
+            seed=int(design_seed),
+            ridge=design_ridge,
+            log_floor=design_log_floor,
+            min_distance=design_min_selected_distance,
+            anchor_weights=anchor_weight_defs,
+        )
+    else:
+        anchor_indices = []
+        anchor_labels = []
+        if anchor_weight_defs:
+            for label, anchor in anchor_weight_defs:
+                matches = np.where(np.linalg.norm(candidate_weights - anchor, axis=1) < 1e-9)[0]
+                if len(matches):
+                    anchor_indices.append(int(matches[0]))
+                    anchor_labels.append(label)
+        selection = select_random_design(
+            candidate_weights,
+            domains=domains,
+            num_variants=num_samples_out,
+            basis=design_basis,
+            seed=int(design_seed),
+            ridge=design_ridge,
+            log_floor=design_log_floor,
+            min_distance=design_min_selected_distance,
+            anchor_indices=anchor_indices,
+            anchor_labels=anchor_labels,
+        )
+
+    selected_samples = np.stack([deduped[idx] for idx in selection.selected_indices], axis=0)
 
     logger.info(f"Number of nonzero domains per swarm run: ")
     print([len(np.where(selected_samples[i][0] != 0)[0]) for i in range(len(selected_samples))])
@@ -455,14 +673,44 @@ def generate_weights_dirichlet(
                 logger.info(f"Sample {i}: {selected_samples[i][0]}")
                 logger.info(f"Sample {j}: {selected_samples[j][0]}")
             all_diffs.append(diff)
-            
-    return selected_samples
+
+    summary = {
+        "candidate_sampling_strategy": candidate_sampling_strategy,
+        "candidate_pool_size": int(len(candidate_weights)),
+        "candidate_pool_target_size": int(target_candidate_count),
+        "candidate_attempts": int(attempts),
+        "candidate_min_config_distance": float(candidate_min_config_distance),
+        "design_selection_method": design_selection_method,
+        "selected_indices": [int(idx) for idx in selection.selected_indices],
+        "anchor_indices": [int(idx) for idx in selection.anchor_indices],
+        "anchor_labels": selection.anchor_labels,
+        "design_basis": design_basis,
+        "expanded_columns": selection.expanded_columns,
+        "effective_rank": int(selection.effective_rank),
+        "ridge": float(design_ridge),
+        "log_floor": float(design_log_floor),
+        "logdet": float(selection.logdet),
+        "singular_values": [float(value) for value in selection.singular_values],
+        "condition_number": (
+            float(selection.condition_number) if selection.condition_number is not None else None
+        ),
+        "min_selected_distance": float(design_min_selected_distance),
+        "seed": int(design_seed),
+        "domains": domains,
+    }
+
+    return selected_samples, DesignArtifacts(
+        summary=summary,
+        domains=domains,
+        candidate_weights=candidate_weights,
+        selected_weights=np.stack([sample[0] for sample in selected_samples], axis=0),
+    )
 
 
 
-def mk_mixtures(
+def mk_mixtures_with_metadata(
     config: ExperimentConfig, group_uuid: str, use_cache: bool = True
-) -> list[dict[str, Tuple[float, float]]]:
+) -> tuple[list[dict[str, Tuple[float, float]]], DesignArtifacts]:
     random.seed(config.seed)
     np.random.seed(config.seed)
 
@@ -504,7 +752,7 @@ def mk_mixtures(
     min_topic_strength = config.min_topic_strength if config.min_topic_strength else config.min_strength
     max_topic_strength = config.max_topic_strength if config.max_topic_strength else config.max_strength
 
-    mixtures = generate_weights_dirichlet(
+    mixtures, design_artifacts = generate_weights_dirichlet(
         sources=sources,
         leaf_dist=leaf_dist,
         minimum_source_weight=minimum_source_weight,
@@ -524,7 +772,21 @@ def mk_mixtures(
         fixed_source_weights=config.fixed_source_weights,
         manual_prior=config.manual_prior,
         sample_multiplier=config.sample_multiplier,
-        existing_mix_file=config.existing_mix_file
+        existing_mix_file=config.existing_mix_file,
+        max_repetition_ratio=config.max_repetition_ratio,
+        candidate_sampling_strategy=config.candidate_sampling_strategy,
+        candidate_pool_size=config.candidate_pool_size,
+        candidate_random_seed=config.candidate_random_seed or config.seed,
+        candidate_vertex_prob=config.candidate_vertex_prob,
+        candidate_min_dominant_weight=config.candidate_min_dominant_weight,
+        candidate_min_config_distance=config.candidate_min_config_distance,
+        design_selection_method=config.design_selection_method,
+        design_basis=config.design_basis,
+        design_random_seed=config.design_random_seed or config.seed,
+        design_ridge=config.design_ridge,
+        design_log_floor=config.design_log_floor,
+        design_min_selected_distance=config.design_min_selected_distance,
+        design_anchor_points=config.design_anchor_points,
     )
 
     weight_maps = []
@@ -593,7 +855,14 @@ def mk_mixtures(
         plt.savefig(out_path, dpi=200)
         plt.close()
 
-    return weight_maps
+    return weight_maps, design_artifacts
+
+
+def mk_mixtures(
+    config: ExperimentConfig, group_uuid: str, use_cache: bool = True
+) -> list[dict[str, Tuple[float, float]]]:
+    mixes, _ = mk_mixtures_with_metadata(config, group_uuid, use_cache=use_cache)
+    return mixes
 
 
 def _bytes_to_tokens(num_bytes: int, dtype: NumpyDatasetDType) -> int:
@@ -899,4 +1168,3 @@ def _expand_remote(pattern: str, fs: Optional[Union[s3fs.S3FileSystem, gcsfs.GCS
         raise NotImplementedError("Remote 'file' types are not currently supported")
     else:
         raise NotImplementedError(f"Glob expansion is not currently supported for '{parsed.scheme}' files")
-

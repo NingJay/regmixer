@@ -1,21 +1,36 @@
 name: "nemo-cc-round1a-actual-quality"
-description: "Round-1a: actual 内部质量桶比例搜索（15 variants × 3B tokens）"
+description: "Round-1a: actual 内部质量桶比例搜索（16 variants × 3B tokens, mixed sampling + D-opt）"
 budget: "ai2/oe-data"
 workspace: "ai2/dolma2"
 nodes: 1
 gpus: 1
-variants: 15  # 3 个质量桶 × 5 = 15 variants
+variants: 16
 preemptible: true
 max_tokens: 3_000_000_000  # 3B tokens（30M * 20 * 5 == 5xC scale）
 allow_repetition: true  # 必须启用：最大数据集 1.17B tokens
 max_repetition_ratio: 5.0  # 允许数据循环最多 5 倍
 sequence_length: 2048
 seed: 42
-temperature: 0.75
+mix_temperature: 0.75
 minimum_weight: 0.0001
 min_strength: 0.1
 max_strength: 20
 sample_multiplier: 50
+candidate_sampling_strategy: mixed
+candidate_pool_size: 4096
+candidate_random_seed: 42
+candidate_vertex_prob: 0.2
+candidate_min_dominant_weight: 0.7
+candidate_min_config_distance: 0.02
+design_selection_method: d_opt
+design_basis: quadratic_logratio_2d
+design_random_seed: 42
+design_ridge: 1.0e-6
+design_log_floor: 1.0e-4
+design_min_selected_distance: 0.03
+design_anchor_points:
+  - vertices
+  - centroid
 proxy_model_id: "olmo_30m"  # 30M 参数模型
 tokenizer: "openseek"  # OpenSeek tokenizer（vocab=151851, eos=151850）
 weka: false
@@ -45,7 +60,7 @@ nonzero_weight:
 # Round-1a: actual 质量桶比例搜索（仅高质量数据）
 # ============================================================================
 # 目标: 找到 actual 内部最优质量分布（仅使用 high/medium_high/medium）
-# Variants: 3 个质量桶 × 5 = 15 variants
+# Variants: 16（3 个顶点 + 1 个质心 + 12 个 D-opt 设计点）
 # 输出: p*_actual_quality = {high: a%, medium_high: b%, medium: c%}
 #
 # 数据充足度分析（实际统计 - 2026-02-12）
@@ -60,4 +75,5 @@ nonzero_weight:
 # ⚠️ 数据循环限制：max_repetition_ratio=5.0（最多循环 5 倍）
 # ✅ allow_repetition=true 已启用
 # ✅ 移除低质量数据（medium_low, low），专注高质量数据搜索
-# ℹ️ 先验分布来源：manual_prior 基于实际token数计算
+# ℹ️ 候选采样：mixed（40% dirichlet / 40% uniform / 20% vertex-biased）
+# ℹ️ 设计选择：D-opt，固定 anchors = vertices + centroid

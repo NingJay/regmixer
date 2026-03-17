@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from regmixer.cli import fit_mixture_command
 from regmixer.local_fit import run_local_fit
 from regmixer.eval.task_standards import MMLU_GROUP_WEIGHTS
 
@@ -261,3 +262,8 @@ def test_run_local_fit_real_regressors_compare_smoke(tmp_path: Path):
         assert payload["regression_type"] == regression_type
         assert payload["weights_sum"] == pytest.approx(1.0)
         assert math.isfinite(payload["predicted_best_score"])
+
+
+def test_fit_mixture_cli_defaults_to_log_linear():
+    regression_option = next(param for param in fit_mixture_command.params if param.name == "regression_type")
+    assert regression_option.default == "log_linear"

@@ -18,12 +18,12 @@
 # │   调用: python -m regmixer.cli generate-mixes                           │
 # │   输入: nemotron-cc-round1a-actual-quality.yaml                         │
 # │   输出: round1a_actual_quality_mixes.json                               │
-# │   作用: 生成 15 个候选 actual 质量桶配比                                │
+# │   作用: 生成 round1a actual 质量桶候选池，并选出最终设计点              │
 # └──────────────────────────────────────────────────────────────────────────┘
 #                                         │
 #                                         ▼
 # ┌──────────────────────────────────────────────────────────────────────────┐
-# │ 3. 并行训练 15 个 variants                                               │
+# │ 3. 并行训练所有 selected variants                                        │
 # │   调用: scripts/control_plane.py train                                   │
 # │   范围: mix 0..14                                                        │
 # │   资源: control plane 先扫描空闲 GPU，再交给 train executor 执行         │
@@ -100,7 +100,7 @@
 # ============================================================================
 # 目标: 找到 actual 内部最优质量分布（high/medium_high/medium）
 # Variants: 15 (3 质量桶 × 5)
-# Training: 15 variants × 3B tokens = 45B tokens total
+# Training: variants × 3B tokens（从 config / mix 自动推导）
 # Usage:
 #   bash scripts/run_round1a.sh [OUTPUT_DIR]
 #   ROUND1A_OUTPUT_DIR=/path/to/output bash scripts/run_round1a.sh
@@ -112,7 +112,7 @@
 #   EVAL_GPU_IDS="all"  # 并行评测使用的 GPU（默认：每台 host 自动发现全部可用 GPU）
 #   OLMES_BATCH_SIZE=1  # OLMES 评测 batch size（默认：1）
 #   ROUND1A_FORCE_EVAL=0  # 即使 metrics.json 存在也重新评测（1=强制，0=复用，默认：0）
-#   ROUND1A_FIT_REGRESSION_TYPE=quadratic  # 官方 p* 使用的回归器：quadratic/log_linear/lightgbm
+#   ROUND1A_FIT_REGRESSION_TYPE=log_linear  # 官方 p* 使用的回归器：quadratic/log_linear/lightgbm
 #   ROUND1A_COMPARE_REGRESSIONS=1  # 额外生成三路 compare 结果和对比图
 #   ROUND1A_FIT_SEARCH_SAMPLES=200000  # fit-mixture 的 Dirichlet 搜索样本数
 #   ROUND1A_FIT_SEED=42  # fit-mixture 的随机种子
@@ -176,6 +176,53 @@ require_dir() {
     echo "[ERROR] Required directory not found: ${path}"
     exit 1
   fi
+}
+
+load_round1a_config_value() {
+  local config_path="$1"
+  local key="$2"
+  PYTHONPATH=src python - "$config_path" "$key" <<'PY'
+import sys
+from pathlib import Path
+
+from regmixer.utils import config_from_path
+
+config = config_from_path(Path(sys.argv[1]))
+value = getattr(config, sys.argv[2])
+print(value)
+PY
+}
+
+resolve_design_artifact_path() {
+  local mix_path="$1"
+  local mode="$2"
+  PYTHONPATH=src python - "$mix_path" "$mode" <<'PY'
+import sys
+from pathlib import Path
+
+from regmixer.experiment_design import default_design_output_dir, default_design_summary_path
+
+mix_path = Path(sys.argv[1])
+mode = sys.argv[2]
+if mode == "summary":
+    print(default_design_summary_path(mix_path))
+elif mode == "dir":
+    print(default_design_output_dir(mix_path))
+else:
+    raise ValueError(mode)
+PY
+}
+
+load_mix_count() {
+  local mix_path="$1"
+  python - "$mix_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(len(payload["mixes"]))
+PY
 }
 
 run_single_olmes_eval() {
@@ -463,8 +510,10 @@ if [[ "${TRAIN_ROOT_DIR}" != /* ]]; then
 fi
 
 # 实验各阶段共享的路径约定。
-CONFIG_FILE="src/regmixer/config/nemotron-cc-round1a-actual-quality.yaml"
+CONFIG_FILE="${ROUND1A_CONFIG_FILE:-src/regmixer/config/nemotron-cc-round1a-actual-quality.yaml}"
 MIX_FILE="${OUTPUT_DIR}/round1a_actual_quality_mixes.json"
+DESIGN_SUMMARY_PATH="$(resolve_design_artifact_path "${MIX_FILE}" summary)"
+DESIGN_OUTPUT_DIR="$(resolve_design_artifact_path "${MIX_FILE}" dir)"
 GROUP_ID="round1a-actual-quality"
 RUN_NAME_PREFIX="round1a-train"
 LOG_DIR="${OUTPUT_DIR}/logs"
@@ -472,7 +521,7 @@ SUMMARY_DIR="${OUTPUT_DIR}/summaries"
 EVAL_CSV="${OUTPUT_DIR}/eval_metrics.csv"
 P_STAR_OUTPUT="${OUTPUT_DIR}/p_star_actual_quality.json"
 VISUALIZATION_DIR="${OUTPUT_DIR}/visualizations"
-FIT_REGRESSION_TYPE="${ROUND1A_FIT_REGRESSION_TYPE:-quadratic}"
+FIT_REGRESSION_TYPE="${ROUND1A_FIT_REGRESSION_TYPE:-log_linear}"
 COMPARE_REGRESSIONS="${ROUND1A_COMPARE_REGRESSIONS:-0}"
 FIT_SEARCH_SAMPLES="${ROUND1A_FIT_SEARCH_SAMPLES:-200000}"
 FIT_SEED="${ROUND1A_FIT_SEED:-42}"
@@ -498,8 +547,11 @@ fi
 
 # 固定这次 round1a 的搜索范围与训练资源配置。
 MIX_START=0
-MIX_END=14  # 15 variants (0-14)
-TOTAL_VARIANTS=$((MIX_END - MIX_START + 1))
+TOTAL_VARIANTS="$(load_round1a_config_value "${CONFIG_FILE}" variants)"
+MIX_END=$((TOTAL_VARIANTS - 1))
+SAMPLING_STRATEGY="$(load_round1a_config_value "${CONFIG_FILE}" candidate_sampling_strategy)"
+SELECTION_METHOD="$(load_round1a_config_value "${CONFIG_FILE}" design_selection_method)"
+DESIGN_BASIS="$(load_round1a_config_value "${CONFIG_FILE}" design_basis)"
 GPU_IDS="${ROUND1A_GPU_IDS:-all}"
 SCHEDULER_MODE="${ROUND1A_SCHEDULER_MODE:-local}"
 ROUND1A_HOSTS="${ROUND1A_HOSTS:-hpcgpu09,hpcgpu10,hpcgpu11,hpcgpu12,hpcgpu13,hpcgpu14,hpcgpu15}"
@@ -539,6 +591,11 @@ echo "==========================================================================
 echo "Workdir: ${PROJECT_ROOT}"
 echo "Config: ${CONFIG_FILE}"
 echo "Variants: ${MIX_START}-${MIX_END} (${TOTAL_VARIANTS} total)"
+echo "Candidate sampling: ${SAMPLING_STRATEGY}"
+echo "Design selection: ${SELECTION_METHOD}"
+echo "Design basis: ${DESIGN_BASIS}"
+echo "Design summary: ${DESIGN_SUMMARY_PATH}"
+echo "Design diagnostics: ${DESIGN_OUTPUT_DIR}"
 echo "Scheduler mode: ${SCHEDULER_MODE}"
 echo "GPU selection: ${GPU_IDS}"
 echo "Fit regression: ${FIT_REGRESSION_TYPE}"
@@ -561,7 +618,7 @@ fi
 echo "============================================================================"
 echo ""
 
-# Step 1: 生成 15 个待搜索的 mix 配置。
+# Step 1: 生成待搜索的 mix 配置，并写出 design summary / diagnostics。
 if [ "${START_STEP}" -le 1 ]; then
   echo "[Step 1/6] Generating mixes..."
   PYTHONPATH=src python -m regmixer.cli generate-mixes \
@@ -574,11 +631,22 @@ if [ "${START_STEP}" -le 1 ]; then
     exit 1
   fi
 
+  require_file "${DESIGN_SUMMARY_PATH}"
+  GENERATED_MIX_COUNT="$(load_mix_count "${MIX_FILE}")"
+  TOTAL_VARIANTS="${GENERATED_MIX_COUNT}"
+  MIX_END=$((TOTAL_VARIANTS - 1))
   echo "✓ Mixes generated: ${MIX_FILE}"
+  echo "✓ Design summary generated: ${DESIGN_SUMMARY_PATH}"
+  echo "✓ Design diagnostics directory: ${DESIGN_OUTPUT_DIR}"
   echo ""
 else
   require_file "${MIX_FILE}"
+  require_file "${DESIGN_SUMMARY_PATH}"
+  GENERATED_MIX_COUNT="$(load_mix_count "${MIX_FILE}")"
+  TOTAL_VARIANTS="${GENERATED_MIX_COUNT}"
+  MIX_END=$((TOTAL_VARIANTS - 1))
   echo "[Step 1/6] Skipped (reusing mixes): ${MIX_FILE}"
+  echo "[Step 1/6] Reusing design summary: ${DESIGN_SUMMARY_PATH}"
   echo ""
 fi
 

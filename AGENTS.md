@@ -20,6 +20,7 @@
 
 - Activate the `regmixer` conda environment before running repo commands locally unless the current shell is already inside an equivalent environment.
 - Treat `scripts/control_plane.py` as the launch loop owner for training and eval. Do not put SSH probing, slot discovery, or host-pool policy back into `parallel_train.py` or `parallel_eval.py`.
+- Treat `generate-mixes` as the owner of round1a experiment design. Candidate sampling and final design selection belong there, not in `control_plane.py`, `parallel_*`, or `fit-mixture`.
 - Treat `scripts/parallel_train.py` and `scripts/parallel_eval.py` as executor-only queue workers that consume an explicit slot plan.
 - Treat `/home/staff/jiayining/vibe_research/regmixer` as the harness/control plane and `/home/staff/jiayining/LLM101-dicksuck-r2/regmixer` as the runtime tree when real experiment files or configs only exist there.
 - The split between control plane and runtime tree is a temporary compatibility measure, not the desired steady state. Prefer converging back to one repo when the harness and runtime paths can safely be unified.
@@ -30,7 +31,8 @@
 - Read `control_plane_state.json`, the relevant executor state file, and the per-task logs before changing scheduling or reporting a failure.
 - Prefer targeted verification over full-suite testing. Default ladder: edited-file syntax check or focused pytest, then local control-plane integration tests, then 1-mix real cluster smoke, then wider cluster occupancy only after the 1-mix run is healthy.
 - Classify failures before redesigning the harness: `control-plane/probe`, `executor/runtime API drift`, or `training logic`.
-- For round1a fitting, treat `p_star_actual_quality.json` as the canonical downstream artifact. Treat `fit_compare/` as diagnostics only.
+- For round1a fitting, treat `p_star_actual_quality.json` as the canonical downstream artifact. The default canonical regressor is `log_linear`. Treat `fit_compare/` as diagnostics only.
+- For round1a design artifacts, keep `*_mixes.json` and `*_design_summary.json` separate. Never write control metadata into the mix schema.
 
 ## Default workflow
 
@@ -45,6 +47,7 @@
 9. Monitor `control_plane_state.json`, `parallel_train_state.json`, `parallel_eval_state.json`, `outputs/.../logs/*.log`, `outputs/.../summaries/*.json`, and `eval/eval_logs/*.log`.
 10. Only contact the user when a task hits an authorization boundary or a non-trivial failure.
 11. When round1a fit diagnostics are requested, keep `ROUND1A_FIT_REGRESSION_TYPE` explicit and enable `ROUND1A_COMPARE_REGRESSIONS=1`.
+12. When round1a uses `mixed + d_opt`, inspect `*_design_summary.json` and `design/` before blaming the fitter.
 
 ## Natural-Language Launch Contract
 
